@@ -20,20 +20,22 @@ from ..minute_bars import (
     BcolzMinuteBarWriter,
 )
 from zipline.assets import AssetDBWriter, AssetFinder, ASSET_DB_VERSION
+from zipline.assets.asset_db_migrations import downgrade
 from zipline.utils.cache import (
     dataframe_cache,
     working_dir,
+    working_file,
 )
 from zipline.utils.compat import mappingproxy
 from zipline.utils.input_validation import ensure_timestamp, optionally
 import zipline.utils.paths as pth
 from zipline.utils.preprocess import preprocess
-from zipline.utils.calendars import get_calendar, register_calendar
+from zipline.utils.calendars import get_calendar
 
 
-def asset_db_path(bundle_name, timestr, environ=None):
+def asset_db_path(bundle_name, timestr, environ=None, db_version=None):
     return pth.data_path(
-        asset_db_relative(bundle_name, timestr, environ),
+        asset_db_relative(bundle_name, timestr, environ, db_version),
         environ=environ,
     )
 
@@ -82,8 +84,10 @@ def minute_equity_relative(bundle_name, timestr, environ=None):
     return bundle_name, timestr, 'minute_equities.bcolz'
 
 
-def asset_db_relative(bundle_name, timestr, environ=None):
-    return bundle_name, timestr, 'assets-%d.sqlite' % ASSET_DB_VERSION
+def asset_db_relative(bundle_name, timestr, environ=None, db_version=None):
+    db_version = ASSET_DB_VERSION if db_version is None else db_version
+
+    return bundle_name, timestr, 'assets-%d.sqlite' % db_version
 
 
 def to_bundle_ingest_dirname(ts):
@@ -119,9 +123,23 @@ def from_bundle_ingest_dirname(cs):
     return pd.Timestamp(cs.replace(';', ':'))
 
 
-_BundlePayload = namedtuple(
-    '_BundlePayload',
-    'calendar start_session end_session minutes_per_day ingest create_writers',
+def ingestions_for_bundle(bundle, environ=None):
+    return sorted(
+        (from_bundle_ingest_dirname(ing)
+         for ing in os.listdir(pth.data_path([bundle], environ))
+         if not pth.hidden(ing)),
+        reverse=True,
+    )
+
+
+RegisteredBundle = namedtuple(
+    'RegisteredBundle',
+    ['calendar_name',
+     'start_session',
+     'end_session',
+     'minutes_per_day',
+     'ingest',
+     'create_writers']
 )
 
 BundleData = namedtuple(
@@ -206,7 +224,7 @@ def _make_bundle_core():
     @curry
     def register(name,
                  f,
-                 calendar='NYSE',
+                 calendar_name='NYSE',
                  start_session=None,
                  end_session=None,
                  minutes_per_day=390,
@@ -243,10 +261,9 @@ def _make_bundle_core():
                   successful load.
               show_progress : bool
                   Show the progress for the current load where possible.
-        calendar : zipline.utils.calendars.TradingCalendar or str, optional
-            The trading calendar to align the data to, or the name of a trading
-            calendar. This defaults to 'NYSE', in which case we use the NYSE
-            calendar.
+        calendar_name : str, optional
+            The name of a calendar used to align bundle data.
+            Default is 'NYSE'.
         start_session : pd.Timestamp, optional
             The first session for which we want data. If not provided,
             or if the date lies outside the range supported by the
@@ -282,24 +299,17 @@ def _make_bundle_core():
                 stacklevel=3,
             )
 
-        if isinstance(calendar, str):
-            calendar = get_calendar(calendar)
-
-        # If the start and end sessions are not provided or lie outside
-        # the bounds of the calendar being used, set them to the first
-        # and last sessions of the calendar.
-        if start_session is None or start_session < calendar.first_session:
-            start_session = calendar.first_session
-        if end_session is None or end_session > calendar.last_session:
-            end_session = calendar.last_session
-
-        _bundles[name] = _BundlePayload(
-            calendar,
-            start_session,
-            end_session,
-            minutes_per_day,
-            f,
-            create_writers,
+        # NOTE: We don't eagerly compute calendar values here because
+        # `register` is called at module scope in zipline, and creating a
+        # calendar currently takes between 0.5 and 1 seconds, which causes a
+        # noticeable delay on the zipline CLI.
+        _bundles[name] = RegisteredBundle(
+            calendar_name=calendar_name,
+            start_session=start_session,
+            end_session=end_session,
+            minutes_per_day=minutes_per_day,
+            ingest=f,
+            create_writers=create_writers,
         )
         return f
 
@@ -328,6 +338,7 @@ def _make_bundle_core():
     def ingest(name,
                environ=os.environ,
                timestamp=None,
+               assets_versions=(),
                show_progress=False):
         """Ingest data for a given bundle.
 
@@ -340,6 +351,8 @@ def _make_bundle_core():
         timestamp : datetime, optional
             The timestamp to use for the load.
             By default this is the current time.
+        assets_versions : Iterable[int], optional
+            Versions of the assets db to which to downgrade.
         show_progress : bool, optional
             Tell the ingest function to display the progress where possible.
         """
@@ -348,9 +361,21 @@ def _make_bundle_core():
         except KeyError:
             raise UnknownBundle(name)
 
+        calendar = get_calendar(bundle.calendar_name)
+
+        start_session = bundle.start_session
+        end_session = bundle.end_session
+
+        if start_session is None or start_session < calendar.first_session:
+            start_session = calendar.first_session
+
+        if end_session is None or end_session > calendar.last_session:
+            end_session = calendar.last_session
+
         if timestamp is None:
             timestamp = pd.Timestamp.utcnow()
         timestamp = timestamp.tz_convert('utc').tz_localize(None)
+
         timestr = to_bundle_ingest_dirname(timestamp)
         cachepath = cache_path(name, environ=environ)
         pth.ensure_directory(pth.data_path([name, timestr], environ=environ))
@@ -370,9 +395,9 @@ def _make_bundle_core():
                 )
                 daily_bar_writer = BcolzDailyBarWriter(
                     daily_bars_path,
-                    bundle.calendar,
-                    bundle.start_session,
-                    bundle.end_session,
+                    calendar,
+                    start_session,
+                    end_session,
                 )
                 # Do an empty write to ensure that the daily ctables exist
                 # when we create the SQLiteAdjustmentWriter below. The
@@ -384,23 +409,22 @@ def _make_bundle_core():
                     wd.ensure_dir(*minute_equity_relative(
                         name, timestr, environ=environ)
                     ),
-                    bundle.calendar,
-                    bundle.start_session,
-                    bundle.end_session,
+                    calendar,
+                    start_session,
+                    end_session,
                     minutes_per_day=bundle.minutes_per_day,
                 )
-                asset_db_writer = AssetDBWriter(
-                    wd.getpath(*asset_db_relative(
-                        name, timestr, environ=environ,
-                    ))
-                )
+                assets_db_path = wd.getpath(*asset_db_relative(
+                    name, timestr, environ=environ,
+                ))
+                asset_db_writer = AssetDBWriter(assets_db_path)
 
                 adjustment_db_writer = stack.enter_context(
                     SQLiteAdjustmentWriter(
                         wd.getpath(*adjustment_db_relative(
                             name, timestr, environ=environ)),
                         BcolzDailyBarReader(daily_bars_path),
-                        bundle.calendar.all_sessions,
+                        calendar.all_sessions,
                         overwrite=True,
                     )
                 )
@@ -409,19 +433,31 @@ def _make_bundle_core():
                 minute_bar_writer = None
                 asset_db_writer = None
                 adjustment_db_writer = None
+                if assets_versions:
+                    raise ValueError('Need to ingest a bundle that creates '
+                                     'writers in order to downgrade the assets'
+                                     ' db.')
             bundle.ingest(
                 environ,
                 asset_db_writer,
                 minute_bar_writer,
                 daily_bar_writer,
                 adjustment_db_writer,
-                bundle.calendar,
-                bundle.start_session,
-                bundle.end_session,
+                calendar,
+                start_session,
+                end_session,
                 cache,
                 show_progress,
                 pth.data_path([name, timestr], environ=environ),
             )
+
+            for version in sorted(set(assets_versions), reverse=True):
+                version_path = wd.getpath(*asset_db_relative(
+                    name, timestr, environ=environ, db_version=version,
+                ))
+                with working_file(version_path) as wf:
+                    shutil.copy2(assets_db_path, wf.path)
+                    downgrade(wf.path, version)
 
     def most_recent_data(bundle_name, timestamp, environ=None):
         """Get the path to the most recent data after ``date``for the
@@ -582,7 +618,5 @@ def _make_bundle_core():
 
     return BundleCore(bundles, register, unregister, ingest, load, clean)
 
-bundles, register, unregister, ingest, load, clean = _make_bundle_core()
 
-register_calendar("YAHOO", get_calendar("NYSE"))
-register_calendar("QUANDL", get_calendar("NYSE"))
+bundles, register, unregister, ingest, load, clean = _make_bundle_core()

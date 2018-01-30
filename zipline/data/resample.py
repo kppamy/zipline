@@ -12,11 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import OrderedDict
+from abc import ABCMeta, abstractmethod
 
 import numpy as np
 import pandas as pd
-from pandas import DataFrame
+from six import with_metaclass
 
+from zipline.data._resample import (
+    _minute_to_session_open,
+    _minute_to_session_high,
+    _minute_to_session_low,
+    _minute_to_session_close,
+    _minute_to_session_volume,
+)
+from zipline.data.bar_reader import NoDataOnDate
+from zipline.data.minute_bars import MinuteBarReader
 from zipline.data.session_bars import SessionBarReader
 from zipline.utils.memoize import lazyval
 
@@ -29,7 +39,8 @@ _MINUTE_TO_SESSION_OHCLV_HOW = OrderedDict((
 ))
 
 
-def minute_to_session(minute_frame, calendar):
+def minute_frame_to_session_frame(minute_frame, calendar):
+
     """
     Resample a DataFrame with minute data into the frame expected by a
     BcolzDailyBarWriter.
@@ -51,8 +62,94 @@ def minute_to_session(minute_frame, calendar):
     """
     how = OrderedDict((c, _MINUTE_TO_SESSION_OHCLV_HOW[c])
                       for c in minute_frame.columns)
-    return minute_frame.groupby(calendar.minute_to_session_label).agg(
-        how)
+    return minute_frame.groupby(calendar.minute_to_session_label).agg(how)
+
+
+def minute_panel_to_session_panel(minute_panel, calendar):
+    """
+    Resample a Panel with minute data into a daily data Panel accepted by
+    PanelBarReader.
+
+    Parameters
+    ----------
+    minute_panel : pd.Panel
+        A pricing data Panel with axes:
+          * items: assets
+          * major_axis: minute pd.DatetimeIndex
+          * minor_axis: labels ['open', 'high', 'low', 'close', 'volume']
+    calendar : zipline.utils.calendars.trading_calendar.TradingCalendar
+        A TradingCalendar on which session labels to resample from minute
+        to session.
+    """
+    def get_first_valid(df):
+        """
+        Return a Series with the first non-nan value in each column.
+
+        On an all-nan column, this function gives nan.
+        """
+        # Indices of first non-nan values
+        idxs = pd.notnull(df).idxmax()
+
+        # Expand indices to one-hot boolean columns
+        indexer = pd.get_dummies(idxs).T.astype(bool)
+
+        # Preserve all indices' values, while others are masked to nan.
+        # Then `.max()` selects the non-nan value in each column.
+        return df.loc[indexer.index][indexer].max()
+
+    def sum_or_nan(df):
+        """
+        Return `df.sum()`, but nan where the whole column is nan.
+        """
+        return df.sum().mask(pd.isnull(df).all(axis=0))
+
+    def aggregator(session_panel):
+        return pd.DataFrame({
+            'open': get_first_valid(session_panel.loc[:, :, 'open']),
+            'close': get_first_valid(session_panel.loc[:, ::-1, 'close']),
+            'high': session_panel.loc[:, :, 'high'].max(),
+            'low': session_panel.loc[:, :, 'low'].min(),
+            'volume': sum_or_nan(session_panel.loc[:, :, 'volume']),
+        }).T
+
+    session_index = calendar.minute_index_to_session_labels(
+        minute_panel.major_axis
+    )
+    return minute_panel.groupby(session_index).agg(aggregator)
+
+
+def minute_to_session(column, close_locs, data, out):
+    """
+    Resample an array with minute data into an array with session data.
+
+    This function assumes that the minute data is the exact length of all
+    minutes in the sessions in the output.
+
+    Parameters
+    ----------
+    column : str
+        The `open`, `high`, `low`, `close`, or `volume` column.
+    close_locs : array[intp]
+        The locations in `data` which are the market close minutes.
+    data : array[float64|uint32]
+        The minute data to be sampled into session data.
+        The first value should align with the market open of the first session,
+        containing values for all minutes for all sessions. With the last value
+        being the market close of the last session.
+    out : array[float64|uint32]
+        The output array into which to write the sampled sessions.
+    """
+    if column == 'open':
+        _minute_to_session_open(close_locs, data, out)
+    elif column == 'high':
+        _minute_to_session_high(close_locs, data, out)
+    elif column == 'low':
+        _minute_to_session_low(close_locs, data, out)
+    elif column == 'close':
+        _minute_to_session_close(close_locs, data, out)
+    elif column == 'volume':
+        _minute_to_session_volume(close_locs, data, out)
+    return out
 
 
 class DailyHistoryAggregator(object):
@@ -104,12 +201,12 @@ class DailyHistoryAggregator(object):
         self._one_min = pd.Timedelta('1 min').value
 
     def _prelude(self, dt, field):
-        date = dt.date()
+        session = self._trading_calendar.minute_to_session_label(dt)
         dt_value = dt.value
         cache = self._caches[field]
-        if cache is None or cache[0] != date:
-            market_open = self._market_opens.loc[date]
-            cache = self._caches[field] = (dt.date(), market_open, {})
+        if cache is None or cache[0] != session:
+            market_open = self._market_opens.loc[session]
+            cache = self._caches[field] = (session, market_open, {})
 
         _, market_open, entries = cache
         market_open = market_open.tz_localize('UTC')
@@ -243,7 +340,7 @@ class DailyHistoryAggregator(object):
                             dt,
                             [asset],
                         )[0].T
-                        val = max(last_max, np.nanmax(window))
+                        val = np.nanmax(np.append(window, last_max))
                         entries[asset] = (dt_value, val)
                         highs.append(val)
                         continue
@@ -307,11 +404,7 @@ class DailyHistoryAggregator(object):
                             dt,
                             [asset],
                         )[0].T
-                        window_min = np.nanmin(window)
-                        if pd.isnull(window_min):
-                            val = last_min
-                        else:
-                            val = min(last_min, window_min)
+                        val = np.nanmin(np.append(window, last_min))
                         entries[asset] = (dt_value, val)
                         lows.append(val)
                         continue
@@ -345,6 +438,23 @@ class DailyHistoryAggregator(object):
         closes = []
         session_label = self._trading_calendar.minute_to_session_label(dt)
 
+        def _get_filled_close(asset):
+            """
+            Returns the most recent non-nan close for the asset in this
+            session. If there has been no data in this session on or before the
+            `dt`, returns `nan`
+            """
+            window = self._minute_reader.load_raw_arrays(
+                ['close'],
+                market_open,
+                dt,
+                [asset],
+            )[0]
+            try:
+                return window[~np.isnan(window)][-1]
+            except IndexError:
+                return np.NaN
+
         for asset in assets:
             if not asset.is_alive_for_session(session_label):
                 closes.append(np.NaN)
@@ -373,9 +483,7 @@ class DailyHistoryAggregator(object):
                         val = self._minute_reader.get_value(
                             asset, dt, 'close')
                         if pd.isnull(val):
-                            val = self.closes(
-                                [asset],
-                                pd.Timestamp(prev_dt, tz='UTC'))[0]
+                            val = _get_filled_close(asset)
                         entries[asset] = (dt_value, val)
                         closes.append(val)
                         continue
@@ -383,8 +491,7 @@ class DailyHistoryAggregator(object):
                     val = self._minute_reader.get_value(
                         asset, dt, 'close')
                     if pd.isnull(val):
-                        val = self.closes([asset],
-                                          pd.Timestamp(prev_dt, tz='UTC'))[0]
+                        val = _get_filled_close(asset)
                     entries[asset] = (dt_value, val)
                     closes.append(val)
                     continue
@@ -461,29 +568,64 @@ class MinuteResampleSessionBarReader(SessionBarReader):
         self._calendar = calendar
         self._minute_bar_reader = minute_bar_reader
 
-    def _get_resampled(self, columns, start_dt, end_dt, assets):
+    def _get_resampled(self, columns, start_session, end_session, assets):
+        range_open = self._calendar.session_open(start_session)
+        range_close = self._calendar.session_close(end_session)
+
         minute_data = self._minute_bar_reader.load_raw_arrays(
-            columns, start_dt, end_dt, assets)
-        dts = self._calendar.minutes_in_range(start_dt, end_dt)
-        minute_frame = DataFrame(
-            [d.T[0] for d in minute_data], index=columns, columns=dts).T
-        return minute_to_session(minute_frame, self._calendar)
+            columns,
+            range_open,
+            range_close,
+            assets,
+        )
+
+        # Get the index of the close minute for each session in the range.
+        # If the range contains only one session, the only close in the range
+        # is the last minute in the data. Otherwise, we need to get all the
+        # session closes and find their indices in the range of minutes.
+        if start_session == end_session:
+            close_ilocs = np.array([len(minute_data[0]) - 1], dtype=np.int64)
+        else:
+            minutes = self._calendar.minutes_in_range(
+                range_open,
+                range_close,
+            )
+            session_closes = self._calendar.session_closes_in_range(
+                start_session,
+                end_session,
+            )
+            close_ilocs = minutes.searchsorted(session_closes.values)
+
+        results = []
+        shape = (len(close_ilocs), len(assets))
+
+        for col in columns:
+            if col != 'volume':
+                out = np.full(shape, np.nan)
+            else:
+                out = np.zeros(shape, dtype=np.uint32)
+            results.append(out)
+
+        for i in range(len(assets)):
+            for j, column in enumerate(columns):
+                data = minute_data[j][:, i]
+                minute_to_session(column, close_ilocs, data, results[j][:, i])
+
+        return results
 
     @property
     def trading_calendar(self):
         return self._calendar
 
-    def load_raw_arrays(self, columns, start_dt, end_dt, assets):
-        return self._get_resampled(columns, start_dt, end_dt, assets).values
+    def load_raw_arrays(self, columns, start_dt, end_dt, sids):
+        return self._get_resampled(columns, start_dt, end_dt, sids)
 
-    def spot_price(self, sid, session, colname):
+    def get_value(self, sid, session, colname):
         # WARNING: This will need caching or other optimization if used in a
         # tight loop.
         # This was developed to complete interface, but has not been tuned
         # for real world use.
-        start, end = self._calendar.open_and_close_for_session(session)
-        frame = self._get_resampled([colname], start, end, [sid])
-        return frame.loc[session, colname]
+        return self._get_resampled([colname], session, session, [sid])[0][0][0]
 
     @lazyval
     def sessions(self):
@@ -498,3 +640,146 @@ class MinuteResampleSessionBarReader(SessionBarReader):
         return self.trading_calendar.minute_to_session_label(
             self._minute_bar_reader.last_available_dt
         )
+
+    @property
+    def first_trading_day(self):
+        return self._minute_bar_reader.first_trading_day
+
+    def get_last_traded_dt(self, asset, dt):
+        return self.trading_calendar.minute_to_session_label(
+            self._minute_bar_reader.get_last_traded_dt(asset, dt))
+
+
+class ReindexBarReader(with_metaclass(ABCMeta)):
+    """
+    A base class for readers which reindexes results, filling in the additional
+    indices with empty data.
+
+    Used to align the reading assets which trade on different calendars.
+
+    Currently only supports a ``trading_calendar`` which is a superset of the
+    ``reader``'s calendar.
+
+    Parameters
+    ----------
+
+    - trading_calendar : zipline.utils.trading_calendar.TradingCalendar
+       The calendar to use when indexing results from the reader.
+    - reader : MinuteBarReader|SessionBarReader
+       The reader which has a calendar that is a subset of the desired
+       ``trading_calendar``.
+    - first_trading_session : pd.Timestamp
+       The first trading session the reader should provide. Must be specified,
+       since the ``reader``'s first session may not exactly align with the
+       desired calendar. Specifically, in the case where the first session
+       on the target calendar is a holiday on the ``reader``'s calendar.
+    - last_trading_session : pd.Timestamp
+       The last trading session the reader should provide. Must be specified,
+       since the ``reader``'s last session may not exactly align with the
+       desired calendar. Specifically, in the case where the last session
+       on the target calendar is a holiday on the ``reader``'s calendar.
+    """
+
+    def __init__(self,
+                 trading_calendar,
+                 reader,
+                 first_trading_session,
+                 last_trading_session):
+        self._trading_calendar = trading_calendar
+        self._reader = reader
+        self._first_trading_session = first_trading_session
+        self._last_trading_session = last_trading_session
+
+    @property
+    def last_available_dt(self):
+        return self._reader.last_available_dt
+
+    def get_last_traded_dt(self, sid, dt):
+        return self._reader.get_last_traded_dt(sid, dt)
+
+    @property
+    def first_trading_day(self):
+        return self._reader.first_trading_day
+
+    def get_value(self, sid, dt, field):
+        # Give an empty result if no data is present.
+        try:
+            return self._reader.get_value(sid, dt, field)
+        except NoDataOnDate:
+            if field == 'volume':
+                return 0
+            else:
+                return np.nan
+
+    @abstractmethod
+    def _outer_dts(self, start_dt, end_dt):
+        raise NotImplementedError
+
+    @abstractmethod
+    def _inner_dts(self, start_dt, end_dt):
+        raise NotImplementedError
+
+    @property
+    def trading_calendar(self):
+        return self._trading_calendar
+
+    @lazyval
+    def sessions(self):
+        return self.trading_calendar.sessions_in_range(
+            self._first_trading_session,
+            self._last_trading_session
+        )
+
+    def load_raw_arrays(self, fields, start_dt, end_dt, sids):
+        outer_dts = self._outer_dts(start_dt, end_dt)
+        inner_dts = self._inner_dts(start_dt, end_dt)
+
+        indices = outer_dts.searchsorted(inner_dts)
+
+        shape = len(outer_dts), len(sids)
+
+        outer_results = []
+
+        if len(inner_dts) > 0:
+            inner_results = self._reader.load_raw_arrays(
+                fields, inner_dts[0], inner_dts[-1], sids)
+        else:
+            inner_results = None
+
+        for i, field in enumerate(fields):
+            if field != 'volume':
+                out = np.full(shape, np.nan)
+            else:
+                out = np.zeros(shape, dtype=np.uint32)
+
+            if inner_results is not None:
+                out[indices] = inner_results[i]
+
+            outer_results.append(out)
+
+        return outer_results
+
+
+class ReindexMinuteBarReader(ReindexBarReader, MinuteBarReader):
+    """
+    See: ``ReindexBarReader``
+    """
+
+    def _outer_dts(self, start_dt, end_dt):
+        return self._trading_calendar.minutes_in_range(start_dt, end_dt)
+
+    def _inner_dts(self, start_dt, end_dt):
+        return self._reader.calendar.minutes_in_range(start_dt, end_dt)
+
+
+class ReindexSessionBarReader(ReindexBarReader, SessionBarReader):
+    """
+    See: ``ReindexBarReader``
+    """
+
+    def _outer_dts(self, start_dt, end_dt):
+        return self.trading_calendar.sessions_in_range(start_dt, end_dt)
+
+    def _inner_dts(self, start_dt, end_dt):
+        return self._reader.trading_calendar.sessions_in_range(
+            start_dt, end_dt)

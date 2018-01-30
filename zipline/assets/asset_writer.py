@@ -28,6 +28,7 @@ from zipline.assets.asset_db_schema import (
     asset_router,
     equities as equities_table,
     equity_symbol_mappings,
+    equity_supplementary_mappings as equity_supplementary_mappings_table,
     futures_contracts as futures_contracts_table,
     futures_exchanges,
     futures_root_symbols,
@@ -35,7 +36,9 @@ from zipline.assets.asset_db_schema import (
     version_info,
 )
 
+from zipline.utils.preprocess import preprocess
 from zipline.utils.range import from_tuple, intersecting_ranges
+from zipline.utils.sqlite_utils import coerce_string_to_eng
 
 # Define a namedtuple for use with the load_data and _load_data methods
 AssetData = namedtuple(
@@ -45,6 +48,7 @@ AssetData = namedtuple(
         'futures',
         'exchanges',
         'root_symbols',
+        'equity_supplementary_mappings',
     ),
 )
 
@@ -62,7 +66,7 @@ _equities_defaults = {
     'symbol': None,
     'asset_name': None,
     'start_date': 0,
-    'end_date': 2 ** 62 - 1,
+    'end_date': np.iinfo(np.int64).max,
     'first_traded': None,
     'auto_close_date': None,
     # the canonical exchange name, like "NYSE"
@@ -77,7 +81,7 @@ _futures_defaults = {
     'root_symbol': None,
     'asset_name': None,
     'start_date': 0,
-    'end_date': 2 ** 62 - 1,
+    'end_date': np.iinfo(np.int64).max,
     'first_traded': None,
     'exchange': None,
     'notice_date': None,
@@ -99,6 +103,16 @@ _root_symbols_defaults = {
     'description': None,
     'exchange': None,
 }
+
+# Default values for the equity_supplementary_mappings DataFrame
+_equity_supplementary_mappings_defaults = {
+    'sid': None,
+    'value': None,
+    'field': None,
+    'start_date': 0,
+    'end_date': np.iinfo(np.int64).max,
+}
+
 
 # Fuzzy symbol delimiters that may break up a company symbol and share class
 _delimited_symbol_delimiters_regex = re.compile(r'[./\-_]')
@@ -187,7 +201,7 @@ def _generate_output_dataframe(data_subset, defaults):
 
 
 def _check_asset_group(group):
-    row = group.sort('end_date').iloc[-1]
+    row = group.sort_values('end_date').iloc[-1]
     row.start_date = group.start_date.min()
     row.end_date = group.end_date.max()
     row.drop(list(symbol_columns), inplace=True)
@@ -344,9 +358,8 @@ class AssetDBWriter(object):
     """
     DEFAULT_CHUNK_SIZE = SQLITE_MAX_VARIABLE_NUMBER
 
+    @preprocess(engine=coerce_string_to_eng(require_exists=False))
     def __init__(self, engine):
-        if isinstance(engine, str):
-            engine = sa.create_engine('sqlite:///' + engine)
         self.engine = engine
 
     def write(self,
@@ -354,6 +367,7 @@ class AssetDBWriter(object):
               futures=None,
               exchanges=None,
               root_symbols=None,
+              equity_supplementary_mappings=None,
               chunk_size=DEFAULT_CHUNK_SIZE):
         """Write asset metadata to a sqlite database.
 
@@ -374,11 +388,11 @@ class AssetDBWriter(object):
                   The first date we have trade data for this asset.
               auto_close_date : datetime, optional
                   The date on which to close any positions in this asset.
-              exchange : str, optional
+              exchange : str
                   The exchange where this asset is traded.
 
             The index of this dataframe should contain the sids.
-        futures : pd.Dataframe, optional
+        futures : pd.DataFrame, optional
             The future contract metadata. The columns for this dataframe are:
 
               symbol : str
@@ -394,7 +408,7 @@ class AssetDBWriter(object):
                   The last date we have trade data for this asset.
               first_traded : datetime, optional
                   The first date we have trade data for this asset.
-              exchange : str, optional
+              exchange : str
                   The exchange where this asset is traded.
               notice_date : datetime
                   The date when the owner of the contract may be forced
@@ -409,7 +423,7 @@ class AssetDBWriter(object):
               multiplier: float
                   The amount of the underlying asset represented by this
                   contract.
-        exchanges : pd.Dataframe, optional
+        exchanges : pd.DataFrame, optional
             The exchanges where assets can be traded. The columns of this
             dataframe are:
 
@@ -417,7 +431,7 @@ class AssetDBWriter(object):
                   The name of the exchange.
               timezone : str
                   The timezone of the exchange.
-        root_symbols : pd.Dataframe, optional
+        root_symbols : pd.DataFrame, optional
             The root symbols for the futures contracts. The columns for this
             dataframe are:
 
@@ -431,6 +445,8 @@ class AssetDBWriter(object):
                   A short description of this root symbol.
               exchange : str
                   The exchange where this root symbol is traded.
+        equity_supplementary_mappings : pd.DataFrame, optional
+            Additional mappings from values of abitrary type to assets.
         chunk_size : int, optional
             The amount of rows to write to the SQLite table at once.
             This defaults to the default number of bind params in sqlite.
@@ -441,9 +457,9 @@ class AssetDBWriter(object):
         --------
         zipline.assets.asset_finder
         """
-        with self.engine.begin() as txn:
+        with self.engine.begin() as conn:
             # Create SQL tables if they do not exist.
-            self.init_db(txn)
+            self.init_db(conn)
 
             # Get the data to add to SQL.
             data = self._load_data(
@@ -451,38 +467,59 @@ class AssetDBWriter(object):
                 futures if futures is not None else pd.DataFrame(),
                 exchanges if exchanges is not None else pd.DataFrame(),
                 root_symbols if root_symbols is not None else pd.DataFrame(),
+                (
+                    equity_supplementary_mappings
+                    if equity_supplementary_mappings is not None
+                    else pd.DataFrame()
+                ),
             )
             # Write the data to SQL.
             self._write_df_to_table(
                 futures_exchanges,
                 data.exchanges,
-                txn,
+                conn,
                 chunk_size,
             )
             self._write_df_to_table(
                 futures_root_symbols,
                 data.root_symbols,
-                txn,
+                conn,
                 chunk_size,
+            )
+            self._write_df_to_table(
+                equity_supplementary_mappings_table,
+                data.equity_supplementary_mappings,
+                conn,
+                chunk_size,
+                idx=False,
             )
             self._write_assets(
                 'future',
                 data.futures,
-                txn,
+                conn,
                 chunk_size,
             )
             self._write_assets(
                 'equity',
                 data.equities,
-                txn,
+                conn,
                 chunk_size,
                 mapping_data=data.equities_mappings,
             )
 
-    def _write_df_to_table(self, tbl, df, txn, chunk_size, idx_label=None):
+    def _write_df_to_table(
+        self,
+        tbl,
+        df,
+        txn,
+        chunk_size,
+        idx=True,
+        idx_label=None,
+    ):
         df.to_sql(
             tbl.name,
             txn.connection,
+            index=idx,
             index_label=(
                 idx_label
                 if idx_label is not None else
@@ -638,7 +675,25 @@ class AssetDBWriter(object):
 
         return futures_output
 
-    def _load_data(self, equities, futures, exchanges, root_symbols):
+    def _normalize_equity_supplementary_mappings(self, mappings):
+        mappings_output = _generate_output_dataframe(
+            data_subset=mappings,
+            defaults=_equity_supplementary_mappings_defaults,
+        )
+
+        for col in ('start_date', 'end_date'):
+            mappings_output[col] = _dt_to_epoch_ns(mappings_output[col])
+
+        return mappings_output
+
+    def _load_data(
+        self,
+        equities,
+        futures,
+        exchanges,
+        root_symbols,
+        equity_supplementary_mappings,
+    ):
         """
         Returns a standard set of pandas.DataFrames:
         equities, futures, exchanges, root_symbols
@@ -656,6 +711,12 @@ class AssetDBWriter(object):
         equities_output, equities_mappings = self._normalize_equities(equities)
         futures_output = self._normalize_futures(futures)
 
+        equity_supplementary_mappings_output = (
+            self._normalize_equity_supplementary_mappings(
+                equity_supplementary_mappings,
+            )
+        )
+
         exchanges_output = _generate_output_dataframe(
             data_subset=exchanges,
             defaults=_exchanges_defaults,
@@ -672,4 +733,5 @@ class AssetDBWriter(object):
             futures=futures_output,
             exchanges=exchanges_output,
             root_symbols=root_symbols_output,
+            equity_supplementary_mappings=equity_supplementary_mappings_output,
         )

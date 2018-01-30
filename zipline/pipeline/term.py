@@ -39,6 +39,7 @@ from zipline.utils.numpy_utils import (
 )
 from zipline.utils.sharedoc import (
     templated_docstring,
+    PIPELINE_ALIAS_NAME_DOC,
     PIPELINE_DOWNSAMPLING_FREQUENCY_DOC,
 )
 
@@ -347,6 +348,10 @@ class Term(with_metaclass(ABCMeta, object)):
         """
         raise NotImplementedError('dependencies')
 
+    def short_repr(self):
+        # Default short_repr is just the full repr.
+        return repr(self)
+
 
 class AssetExists(Term):
     """
@@ -590,7 +595,32 @@ class ComputableTerm(Term):
         """
         return data
 
-    def _downsampled_type(self):
+    def to_workspace_value(self, result, assets):
+        """
+        Called with a column of the result of a pipeline. This needs to put
+        the data into a format that can be used in a workspace to continue
+        doing computations.
+
+        Parameters
+        ----------
+        result : pd.Series
+            A multiindexed series with (dates, assets) whose values are the
+            results of running this pipeline term over the dates.
+        assets : pd.Index
+            All of the assets being requested. This allows us to correctly
+            shape the workspace value.
+
+        Returns
+        -------
+        workspace_value : array-like
+            An array like value that the engine can consume.
+        """
+        return result.unstack().fillna(self.missing_value).reindex(
+            columns=assets,
+            fill_value=self.missing_value,
+        ).values
+
+    def _downsampled_type(self, *args, **kwargs):
         """
         The expression type to return from self.downsample().
         """
@@ -610,6 +640,35 @@ class ComputableTerm(Term):
         {frequency}
         """
         return self._downsampled_type(term=self, frequency=frequency)
+
+    def _aliased_type(self, *args, **kwargs):
+        """
+        The expression type to return from self.alias().
+        """
+        raise NotImplementedError(
+            "alias is not yet implemented "
+            "for instances of %s." % type(self).__name__
+        )
+
+    @templated_docstring(name=PIPELINE_ALIAS_NAME_DOC)
+    def alias(self, name):
+        """
+        Make a term from ``self`` that names the expression.
+
+        Parameters
+        ----------
+        {name}
+
+        Returns
+        -------
+        aliased : Aliased
+            ``self`` with a name.
+
+        Notes
+        -----
+        This is useful for giving a name to a numerical or boolean expression.
+        """
+        return self._aliased_type(term=self, name=name)
 
     def __repr__(self):
         return (
@@ -676,6 +735,12 @@ class Slice(ComputableTerm):
         # Return a 2D array with one column rather than a 1D array of the
         # column.
         return windows[0][:, [asset_column]]
+
+    @property
+    def asset(self):
+        """Get the asset whose data is selected by this slice.
+        """
+        return self._asset
 
     @property
     def _downsampled_type(self):

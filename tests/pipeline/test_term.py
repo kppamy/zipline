@@ -71,6 +71,7 @@ class SomeFactor(Factor):
     window_length = 5
     inputs = [SomeDataSet.foo, SomeDataSet.bar]
 
+
 SomeFactorAlias = SomeFactor
 
 
@@ -146,8 +147,8 @@ def to_dict(l):
     """
     Convert a list to a dict with keys drawn from '0', '1', '2', ...
 
-    Example
-    -------
+    Examples
+    --------
     >>> to_dict([2, 3, 4])  # doctest: +SKIP
     {'0': 2, '1': 3, '2': 4}
     """
@@ -195,8 +196,14 @@ class DependencyResolutionTestCase(WithTradingSessions, ZiplineTestCase):
             self.assertIn(SomeDataSet.bar, resolution_order)
             self.assertIn(SomeFactor(), resolution_order)
 
-            self.assertEqual(graph.node[SomeDataSet.foo]['extra_rows'], 4)
-            self.assertEqual(graph.node[SomeDataSet.bar]['extra_rows'], 4)
+            self.assertEqual(
+                graph.graph.node[SomeDataSet.foo]['extra_rows'],
+                4,
+            )
+            self.assertEqual(
+                graph.graph.node[SomeDataSet.bar]['extra_rows'],
+                4,
+            )
 
         for foobar in gen_equivalent_factors():
             check_output(self.make_execution_plan(to_dict([foobar])))

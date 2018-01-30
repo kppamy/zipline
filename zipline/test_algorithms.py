@@ -62,7 +62,7 @@ The algorithm must expose methods:
     algorithm can then check position information with the
     Portfolio object::
 
-        self.Portfolio[sid(133)]['cost_basis']
+        self.Portfolio[sid(133)].cost_basis
 
   - set_transact_setter: method that accepts a callable. Will
     be set as the value of the set_transact_setter method of
@@ -88,7 +88,7 @@ from zipline.api import (
 )
 from zipline.errors import UnsupportedOrderParameters
 from zipline.assets import Future, Equity
-from zipline.finance.commission import PerShare
+from zipline.finance.commission import PerShare, PerTrade
 from zipline.finance.execution import (
     LimitOrder,
     MarketOrder,
@@ -261,9 +261,9 @@ class TestOrderAlgorithm(TradingAlgorithm):
         if self.incr == 0:
             assert 0 not in self.portfolio.positions
         else:
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.incr, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
         self.incr += 1
@@ -279,9 +279,9 @@ class TestOrderInstantAlgorithm(TradingAlgorithm):
         if self.incr == 0:
             assert 0 not in self.portfolio.positions
         else:
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.incr, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 self.last_price, "Orders was not filled at last price."
         self.incr += 1
         self.order_value(self.sid(0), data.current(sid(0), "price"))
@@ -330,9 +330,9 @@ class TestOrderValueAlgorithm(TradingAlgorithm):
         if self.incr == 0:
             assert 0 not in self.portfolio.positions
         else:
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.incr, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
         self.incr += 2
@@ -357,9 +357,9 @@ class TestTargetAlgorithm(TradingAlgorithm):
         if self.target_shares == 0:
             assert 0 not in self.portfolio.positions
         else:
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.target_shares, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
         self.target_shares = 10
@@ -380,9 +380,9 @@ class TestOrderPercentAlgorithm(TradingAlgorithm):
             return
         else:
 
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.target_shares, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
 
@@ -411,26 +411,29 @@ class TestTargetPercentAlgorithm(TradingAlgorithm):
 
     def handle_data(self, data):
         if not self.ordered:
-            assert 0 not in self.portfolio.positions
+            assert not self.portfolio.positions
         else:
             # Since you can't own fractional shares (at least in this
             # example), we want to make sure that our target amount is
             # no more than a share's value away from our current
             # holdings.
             target_value = self.portfolio.portfolio_value * 0.002
-            position_value = self.portfolio.positions[0]['amount'] * \
+            position_value = self.portfolio.positions[0].amount * \
                 self.sale_price
 
             assert abs(target_value - position_value) <= self.sale_price, \
                 "Orders not filled correctly"
 
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
 
         self.sale_price = data.current(sid(0), "price")
-        self.order_target_percent(self.sid(0), .002)
+        self._order(sid(0), .002)
         self.ordered = True
+
+    def _order(self, asset, target):
+        return self.order_target_percent(asset, target)
 
 
 class TestTargetValueAlgorithm(TradingAlgorithm):
@@ -446,9 +449,9 @@ class TestTargetValueAlgorithm(TradingAlgorithm):
             self.target_shares = 10
             return
         else:
-            assert self.portfolio.positions[0]['amount'] == \
+            assert self.portfolio.positions[0].amount == \
                 self.target_shares, "Orders not filled immediately."
-            assert self.portfolio.positions[0]['last_sale_price'] == \
+            assert self.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
 
@@ -482,6 +485,13 @@ class SetMaxLeverageAlgorithm(TradingAlgorithm):
         self.set_max_leverage(max_leverage=max_leverage)
 
 
+class SetMinLeverageAlgorithm(TradingAlgorithm):
+    def initialize(self, min_leverage, grace_period):
+        self.set_min_leverage(
+            min_leverage=min_leverage, grace_period=grace_period
+        )
+
+
 ############################
 # TradingControl Test Algos#
 ############################
@@ -505,9 +515,22 @@ class SetMaxOrderSizeAlgorithm(TradingAlgorithm):
 
 
 class SetDoNotOrderListAlgorithm(TradingAlgorithm):
-    def initialize(self, sid=None, restricted_list=None):
+    def initialize(self, sid=None, restricted_list=None, on_error='fail'):
         self.order_count = 0
-        self.set_do_not_order_list(restricted_list)
+        self.set_do_not_order_list(restricted_list, on_error)
+
+
+class SetAssetRestrictionsAlgorithm(TradingAlgorithm):
+    def initialize(self, sid=None, restrictions=None, on_error='fail'):
+        self.order_count = 0
+        self.set_asset_restrictions(restrictions, on_error)
+
+
+class SetMultipleAssetRestrictionsAlgorithm(TradingAlgorithm):
+    def initialize(self, restrictions1, restrictions2, on_error='fail'):
+        self.order_count = 0
+        self.set_asset_restrictions(restrictions1, on_error)
+        self.set_asset_restrictions(restrictions2, on_error)
 
 
 class SetMaxOrderCountAlgorithm(TradingAlgorithm):
@@ -529,7 +552,7 @@ class SetAssetDateBoundsAlgorithm(TradingAlgorithm):
     AssetDateBounds() trading control in place.
     """
     def initialize(self):
-        self.register_trading_control(AssetDateBounds())
+        self.register_trading_control(AssetDateBounds(on_error='fail'))
 
     def handle_data(algo, data):
         algo.order(algo.sid(999), 1)
@@ -675,6 +698,27 @@ class EmptyPositionsAlgorithm(TradingAlgorithm):
         self.record(num_positions=len(self.portfolio.positions))
 
 
+class TestPositionWeightsAlgorithm(TradingAlgorithm):
+    """
+    An algorithm that records the weights of its portfolio holdings each day.
+    """
+    def initialize(self, sids_and_amounts, *args, **kwargs):
+        self.ordered = False
+        self.sids_and_amounts = sids_and_amounts
+        self.set_commission(us_equities=PerTrade(0), us_futures=PerTrade(0))
+        self.set_slippage(
+            us_equities=FixedSlippage(0), us_futures=FixedSlippage(0),
+        )
+
+    def handle_data(self, data):
+        if not self.ordered:
+            for s, amount in self.sids_and_amounts:
+                self.order(self.sid(s), amount)
+            self.ordered = True
+
+        self.record(position_weights=self.portfolio.current_portfolio_weights)
+
+
 class InvalidOrderAlgorithm(TradingAlgorithm):
     """
     An algorithm that tries to make various invalid order calls, verifying that
@@ -763,15 +807,16 @@ def handle_data_api(context, data):
     if context.incr == 0:
         assert 0 not in context.portfolio.positions
     else:
-        assert context.portfolio.positions[0]['amount'] == \
+        assert context.portfolio.positions[0].amount == \
             context.incr, "Orders not filled immediately."
-        assert context.portfolio.positions[0]['last_sale_price'] == \
+        assert context.portfolio.positions[0].last_sale_price == \
             data.current(sid(0), "price"), \
             "Orders not filled at current price."
     context.incr += 1
     order(sid(0), 1)
 
     record(incr=context.incr)
+
 
 ###########################
 # AlgoScripts as strings
@@ -805,9 +850,9 @@ def handle_data(context, data):
     if context.incr == 0:
         assert 0 not in context.portfolio.positions
     else:
-        assert context.portfolio.positions[0]['amount'] == \
+        assert context.portfolio.positions[0].amount == \
                 context.incr, "Orders not filled immediately."
-        assert context.portfolio.positions[0]['last_sale_price'] == \
+        assert context.portfolio.positions[0].last_sale_price == \
                 data.current(sid(0), "price"), \
                 "Orders not filled at current price."
     context.incr += 1

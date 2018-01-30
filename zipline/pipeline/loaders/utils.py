@@ -2,6 +2,9 @@ import datetime
 
 import numpy as np
 import pandas as pd
+from zipline.errors import NoFurtherDataError
+from zipline.pipeline.common import TS_FIELD_NAME, SID_FIELD_NAME
+from zipline.utils.numpy_utils import categorical_dtype
 from zipline.utils.pandas_utils import mask_between_time
 
 
@@ -229,6 +232,12 @@ def normalize_timestamp_to_query_time(df,
         # don't mutate the dataframe in place
         df = df.copy()
 
+    # There is a pandas bug (0.18.1) where if the timestamps in a
+    # normalized DatetimeIndex are not sorted and one calls `tz_localize(None)`
+    #  on tha DatetimeIndex, some of the dates will be shifted by an hour
+    # (similarly to the previously mentioned bug). Therefore, we must sort
+    # the df here to ensure that we get the normalize correctly.
+    df.sort_values(ts_field, inplace=True)
     dtidx = pd.DatetimeIndex(df.loc[:, ts_field], tz='utc')
     dtidx_local_time = dtidx.tz_convert(tz)
     to_roll_forward = mask_between_time(
@@ -272,3 +281,194 @@ def check_data_query_args(data_query_time, data_query_tz):
                 data_query_tz,
             ),
         )
+
+
+def last_in_date_group(df,
+                       dates,
+                       assets,
+                       reindex=True,
+                       have_sids=True,
+                       extra_groupers=None):
+    """
+    Determine the last piece of information known on each date in the date
+    index for each group. Input df MUST be sorted such that the correct last
+    item is chosen from each group.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The DataFrame containing the data to be grouped. Must be sorted so that
+        the correct last item is chosen from each group.
+    dates : pd.DatetimeIndex
+        The dates to use for grouping and reindexing.
+    assets : pd.Int64Index
+        The assets that should be included in the column multiindex.
+    reindex : bool
+        Whether or not the DataFrame should be reindexed against the date
+        index. This will add back any dates to the index that were grouped
+        away.
+    have_sids : bool
+        Whether or not the DataFrame has sids. If it does, they will be used
+        in the groupby.
+    extra_groupers : list of str
+        Any extra field names that should be included in the groupby.
+
+    Returns
+    -------
+    last_in_group : pd.DataFrame
+        A DataFrame with dates as the index and fields used in the groupby as
+        levels of a multiindex of columns.
+
+    """
+    idx = [dates[dates.searchsorted(
+        df[TS_FIELD_NAME].values.astype('datetime64[D]')
+    )]]
+    if have_sids:
+        idx += [SID_FIELD_NAME]
+    if extra_groupers is None:
+        extra_groupers = []
+    idx += extra_groupers
+
+    last_in_group = df.drop(TS_FIELD_NAME, axis=1).groupby(
+        idx,
+        sort=False,
+    ).last()
+
+    # For the number of things that we're grouping by (except TS), unstack
+    # the df. Done this way because of an unresolved pandas bug whereby
+    # passing a list of levels with mixed dtypes to unstack causes the
+    # resulting DataFrame to have all object-type columns.
+    for _ in range(len(idx) - 1):
+        last_in_group = last_in_group.unstack(-1)
+
+    if reindex:
+        if have_sids:
+            cols = last_in_group.columns
+            last_in_group = last_in_group.reindex(
+                index=dates,
+                columns=pd.MultiIndex.from_product(
+                    tuple(cols.levels[0:len(extra_groupers) + 1]) + (assets,),
+                    names=cols.names,
+                ),
+            )
+        else:
+            last_in_group = last_in_group.reindex(dates)
+
+    return last_in_group
+
+
+def ffill_across_cols(df, columns, name_map):
+    """
+    Forward fill values in a DataFrame with special logic to handle cases
+    that pd.DataFrame.ffill cannot and cast columns to appropriate types.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The DataFrame to do forward-filling on.
+    columns : list of BoundColumn
+        The BoundColumns that correspond to columns in the DataFrame to which
+        special filling and/or casting logic should be applied.
+    name_map: map of string -> string
+        Mapping from the name of each BoundColumn to the associated column
+        name in `df`.
+    """
+    df.ffill(inplace=True)
+
+    # Fill in missing values specified by each column. This is made
+    # significantly more complex by the fact that we need to work around
+    # two pandas issues:
+
+    # 1) When we have sids, if there are no records for a given sid for any
+    #    dates, pandas will generate a column full of NaNs for that sid.
+    #    This means that some of the columns in `dense_output` are now
+    #    float instead of the intended dtype, so we have to coerce back to
+    #    our expected type and convert NaNs into the desired missing value.
+
+    # 2) DataFrame.ffill assumes that receiving None as a fill-value means
+    #    that no value was passed.  Consequently, there's no way to tell
+    #    pandas to replace NaNs in an object column with None using fillna,
+    #    so we have to roll our own instead using df.where.
+    for column in columns:
+        column_name = name_map[column.name]
+        # Special logic for strings since `fillna` doesn't work if the
+        # missing value is `None`.
+        if column.dtype == categorical_dtype:
+            df[column_name] = df[
+                column.name
+            ].where(pd.notnull(df[column_name]),
+                    column.missing_value)
+        else:
+            # We need to execute `fillna` before `astype` in case the
+            # column contains NaNs and needs to be cast to bool or int.
+            # This is so that the NaNs are replaced first, since pandas
+            # can't convert NaNs for those types.
+            df[column_name] = df[
+                column_name
+            ].fillna(column.missing_value).astype(column.dtype)
+
+
+def shift_dates(dates, start_date, end_date, shift):
+    """
+    Shift dates of a pipeline query back by `shift` days.
+
+    load_adjusted_array is called with dates on which the user's algo
+    will be shown data, which means we need to return the data that would
+    be known at the start of each date.  This is often labeled with a
+    previous date in the underlying data (e.g. at the start of today, we
+    have the data as of yesterday). In this case, we can shift the query
+    dates back to query the appropriate values.
+
+    Parameters
+    ----------
+    dates : DatetimeIndex
+        All known dates.
+    start_date : pd.Timestamp
+        Start date of the pipeline query.
+    end_date : pd.Timestamp
+        End date of the pipeline query.
+    shift : int
+        The number of days to shift back the query dates.
+    """
+    try:
+        start = dates.get_loc(start_date)
+    except KeyError:
+        if start_date < dates[0]:
+            raise NoFurtherDataError(
+                msg=(
+                    "Pipeline Query requested data starting on {query_start}, "
+                    "but first known date is {calendar_start}"
+                ).format(
+                    query_start=str(start_date),
+                    calendar_start=str(dates[0]),
+                )
+            )
+        else:
+            raise ValueError("Query start %s not in calendar" % start_date)
+
+    # Make sure that shifting doesn't push us out of the calendar.
+    if start < shift:
+        raise NoFurtherDataError(
+            msg=(
+                "Pipeline Query requested data from {shift}"
+                " days before {query_start}, but first known date is only "
+                "{start} days earlier."
+            ).format(shift=shift, query_start=start_date, start=start),
+        )
+
+    try:
+        end = dates.get_loc(end_date)
+    except KeyError:
+        if end_date > dates[-1]:
+            raise NoFurtherDataError(
+                msg=(
+                    "Pipeline Query requesting data up to {query_end}, "
+                    "but last known date is {calendar_end}"
+                ).format(
+                    query_end=end_date,
+                    calendar_end=dates[-1],
+                )
+            )
+        else:
+            raise ValueError("Query end %s not in calendar" % end_date)
+    return dates[start - shift], dates[end - shift]

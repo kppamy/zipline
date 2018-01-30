@@ -40,7 +40,7 @@ from zipline.utils.calendars import get_calendar
 # IMPORTANT NOTE: You must change this template if you change
 # Asset.__reduce__, or else we'll attempt to unpickle an old version of this
 # class
-CACHE_FILE_TEMPLATE = '/tmp/.%s-%s.v6.cache'
+CACHE_FILE_TEMPLATE = '/tmp/.%s-%s.v7.cache'
 
 
 cdef class Asset:
@@ -58,6 +58,7 @@ cdef class Asset:
     cdef readonly object auto_close_date
 
     cdef readonly object exchange
+    cdef readonly object exchange_full
 
     _kwargnames = frozenset({
         'sid',
@@ -68,6 +69,7 @@ cdef class Asset:
         'first_traded',
         'auto_close_date',
         'exchange',
+        'exchange_full',
     })
 
     def __init__(self,
@@ -78,13 +80,16 @@ cdef class Asset:
                  object start_date=None,
                  object end_date=None,
                  object first_traded=None,
-                 object auto_close_date=None):
+                 object auto_close_date=None,
+                 object exchange_full=None):
 
         self.sid = sid
         self.sid_hash = hash(sid)
         self.symbol = symbol
         self.asset_name = asset_name
         self.exchange = exchange
+        self.exchange_full = (exchange_full if exchange_full is not None
+                              else exchange)
         self.start_date = start_date
         self.end_date = end_date
         self.first_traded = first_traded
@@ -135,20 +140,11 @@ cdef class Asset:
         else:
             raise AssertionError('%d is not an operator' % op)
 
-    def __str__(self):
+    def __repr__(self):
         if self.symbol:
             return '%s(%d [%s])' % (type(self).__name__, self.sid, self.symbol)
         else:
             return '%s(%d)' % (type(self).__name__, self.sid)
-
-    def __repr__(self):
-        attrs = ('symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded', 'auto_close_date')
-        tuples = ((attr, repr(getattr(self, attr, None)))
-                  for attr in attrs)
-        strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
-        params = ', '.join(strings)
-        return 'Asset(%d, %s)' % (self.sid, params)
 
     cpdef __reduce__(self):
         """
@@ -164,7 +160,8 @@ cdef class Asset:
                                  self.start_date,
                                  self.end_date,
                                  self.first_traded,
-                                 self.auto_close_date,))
+                                 self.auto_close_date,
+                                 self.exchange_full))
 
     cpdef to_dict(self):
         """
@@ -179,6 +176,7 @@ cdef class Asset:
             'first_traded': self.first_traded,
             'auto_close_date': self.auto_close_date,
             'exchange': self.exchange,
+            'exchange_full': self.exchange_full,
         }
 
     @classmethod
@@ -225,15 +223,6 @@ cdef class Asset:
 
 
 cdef class Equity(Asset):
-
-    def __repr__(self):
-        attrs = ('symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded', 'auto_close_date')
-        tuples = ((attr, repr(getattr(self, attr, None)))
-                  for attr in attrs)
-        strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
-        params = ', '.join(strings)
-        return 'Equity(%d, %s)' % (self.sid, params)
 
     property security_start_date:
         """
@@ -291,6 +280,7 @@ cdef class Future(Asset):
         'exchange',
         'tick_size',
         'multiplier',
+        'exchange_full',
     })
 
     def __init__(self,
@@ -306,7 +296,8 @@ cdef class Future(Asset):
                  object auto_close_date=None,
                  object first_traded=None,
                  object tick_size="",
-                 float multiplier=1.0):
+                 float multiplier=1.0,
+                 object exchange_full=None):
 
         super().__init__(
             sid,
@@ -317,6 +308,7 @@ cdef class Future(Asset):
             end_date=end_date,
             first_traded=first_traded,
             auto_close_date=auto_close_date,
+            exchange_full=exchange_full,
         )
         self.root_symbol = root_symbol
         self.notice_date = notice_date
@@ -331,17 +323,6 @@ cdef class Future(Asset):
                 self.auto_close_date = notice_date
             else:
                 self.auto_close_date = min(notice_date, expiration_date)
-
-    def __repr__(self):
-        attrs = ('symbol', 'root_symbol', 'asset_name', 'exchange',
-                 'start_date', 'end_date', 'first_traded', 'notice_date',
-                 'expiration_date', 'auto_close_date', 'tick_size',
-                 'multiplier')
-        tuples = ((attr, repr(getattr(self, attr, None)))
-                  for attr in attrs)
-        strings = ('%s=%s' % (t[0], t[1]) for t in tuples)
-        params = ', '.join(strings)
-        return 'Future(%d, %s)' % (self.sid, params)
 
     cpdef __reduce__(self):
         """
@@ -362,7 +343,8 @@ cdef class Future(Asset):
                                  self.auto_close_date,
                                  self.first_traded,
                                  self.tick_size,
-                                 self.multiplier,))
+                                 self.multiplier,
+                                 self.exchange_full))
 
     cpdef to_dict(self):
         """

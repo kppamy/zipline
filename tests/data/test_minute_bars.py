@@ -35,15 +35,20 @@ from pandas import (
     date_range,
 )
 
+from zipline.data.bar_reader import NoDataForSid, NoDataOnDate
 from zipline.data.minute_bars import (
+    BcolzMinuteBarMetadata,
     BcolzMinuteBarWriter,
     BcolzMinuteBarReader,
     BcolzMinuteOverlappingData,
     US_EQUITIES_MINUTES_PER_DAY,
-    BcolzMinuteWriterColumnMismatch
+    BcolzMinuteWriterColumnMismatch,
+    H5MinuteBarUpdateWriter,
+    H5MinuteBarUpdateReader,
 )
 
 from zipline.testing.fixtures import (
+    WithAssetFinder,
     WithInstanceTmpDir,
     WithTradingCalendars,
     ZiplineTestCase,
@@ -57,8 +62,11 @@ TEST_CALENDAR_STOP = Timestamp('2015-12-31', tz='UTC')
 
 
 class BcolzMinuteBarTestCase(WithTradingCalendars,
+                             WithAssetFinder,
                              WithInstanceTmpDir,
                              ZiplineTestCase):
+
+    ASSET_FINDER_EQUITY_SIDS = 1, 2
 
     @classmethod
     def init_class_fixtures(cls):
@@ -87,6 +95,18 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
             US_EQUITIES_MINUTES_PER_DAY,
         )
         self.reader = BcolzMinuteBarReader(self.dest)
+
+    def test_version(self):
+        metadata = self.reader._get_metadata()
+        self.assertEquals(
+            metadata.version,
+            BcolzMinuteBarMetadata.FORMAT_VERSION,
+        )
+
+    def test_no_minute_bars_for_sid(self):
+        minute = self.market_opens[self.test_calendar_start]
+        with self.assertRaises(NoDataForSid):
+            self.reader.get_value(1337, minute, 'close')
 
     def test_write_one_ohlcv(self):
         minute = self.market_opens[self.test_calendar_start]
@@ -120,6 +140,47 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
 
         volume_price = self.reader.get_value(sid, minute, 'volume')
 
+        self.assertEquals(50.0, volume_price)
+
+    def test_write_one_ohlcv_with_ratios(self):
+        minute = self.market_opens[self.test_calendar_start]
+        sid = 1
+        data = DataFrame(
+            data={
+                'open': [10.0],
+                'high': [20.0],
+                'low': [30.0],
+                'close': [40.0],
+                'volume': [50.0],
+            },
+            index=[minute],
+        )
+
+        # Create a new writer with `ohlc_ratios_per_sid` defined.
+        writer_with_ratios = BcolzMinuteBarWriter(
+            self.dest,
+            self.trading_calendar,
+            TEST_CALENDAR_START,
+            TEST_CALENDAR_STOP,
+            US_EQUITIES_MINUTES_PER_DAY,
+            ohlc_ratios_per_sid={sid: 25},
+        )
+        writer_with_ratios.write_sid(sid, data)
+        reader = BcolzMinuteBarReader(self.dest)
+
+        open_price = reader.get_value(sid, minute, 'open')
+        self.assertEquals(10.0, open_price)
+
+        high_price = reader.get_value(sid, minute, 'high')
+        self.assertEquals(20.0, high_price)
+
+        low_price = reader.get_value(sid, minute, 'low')
+        self.assertEquals(30.0, low_price)
+
+        close_price = reader.get_value(sid, minute, 'close')
+        self.assertEquals(40.0, close_price)
+
+        volume_price = reader.get_value(sid, minute, 'volume')
         self.assertEquals(50.0, volume_price)
 
     def test_write_two_bars(self):
@@ -383,35 +444,42 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
             'volume': [10.0]
         }
 
-        first_minute = self.market_opens[TEST_CALENDAR_START]
+        dt = self.market_opens[TEST_CALENDAR_STOP]
         data = DataFrame(
             data=ohlcv,
-            index=[first_minute])
+            index=[dt])
         self.writer.write_sid(sid, data)
 
-        next_day_minute = first_minute + Timedelta(days=1)
+        # Open a new writer to cover `open` method, also a common usage
+        # of appending new days will be writing to an existing directory.
+        cday = self.trading_calendar.schedule.index.freq
+        new_end_session = TEST_CALENDAR_STOP + cday
+        writer = BcolzMinuteBarWriter.open(self.dest, new_end_session)
+        next_day_minute = dt + cday
         new_data = DataFrame(
             data=ohlcv,
             index=[next_day_minute])
-        self.writer.write_sid(sid, new_data)
+        writer.write_sid(sid, new_data)
 
-        second_minute = first_minute + Timedelta(minutes=1)
+        # Get a new reader to test updated calendar.
+        reader = BcolzMinuteBarReader(self.dest)
+
+        second_minute = dt + Timedelta(minutes=1)
 
         # The second minute should have been padded with zeros
         for col in ('open', 'high', 'low', 'close'):
             assert_almost_equal(
-                nan, self.reader.get_value(sid, second_minute, col)
+                nan, reader.get_value(sid, second_minute, col)
             )
         self.assertEqual(
-            0, self.reader.get_value(sid, second_minute, 'volume')
+            0, reader.get_value(sid, second_minute, 'volume')
         )
 
-        # The first day should contain US_EQUITIES_MINUTES_PER_DAY rows.
-        # The second day should contain a single row.
-        self.assertEqual(
-            len(self.writer._ensure_ctable(sid)),
-            US_EQUITIES_MINUTES_PER_DAY + 1,
-        )
+        # The next day minute should have data.
+        for col in ('open', 'high', 'low', 'close', 'volume'):
+            assert_almost_equal(
+                ohlcv[col], reader.get_value(sid, next_day_minute, col)
+            )
 
     def test_write_multiple_sids(self):
         """
@@ -580,7 +648,7 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
                 'high': full(9, nan),
                 'low': full(9, nan),
                 'close': full(9, nan),
-                'volume': full(9, 0),
+                'volume': full(9, 0.0),
             },
             index=[minutes])
         self.writer.write_sid(sid, data)
@@ -623,7 +691,7 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
                 view(float64),
                 'close': ((0b11111111111 << 52) + arange(31, 40, dtype=int64)).
                 view(float64),
-                'volume': full(9, 0),
+                'volume': full(9, 0.0),
             },
             index=[minutes])
         self.writer.write_sid(sid, data)
@@ -846,18 +914,19 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
                 'open'),
             780)
 
-        self.assertEqual(
+        with self.assertRaises(NoDataOnDate):
             self.reader.get_value(
                 sid,
                 Timestamp('2015-06-02', tz='UTC'),
-                'open'),
-            390)
-        self.assertEqual(
+                'open'
+            )
+
+        with self.assertRaises(NoDataOnDate):
             self.reader.get_value(
                 sid,
                 Timestamp('2015-06-02 20:01:00', tz='UTC'),
-                'open'),
-            780)
+                'open'
+            )
 
     def test_adjust_non_trading_minutes_half_days(self):
         # half day
@@ -900,18 +969,20 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
                 Timestamp('2015-11-27 18:01:00', tz='UTC'),
                 'open'),
             210)
-        self.assertEqual(
+
+        with self.assertRaises(NoDataOnDate):
             self.reader.get_value(
                 sid,
                 Timestamp('2015-11-30', tz='UTC'),
-                'open'),
-            210)
-        self.assertEqual(
+                'open'
+            )
+
+        with self.assertRaises(NoDataOnDate):
             self.reader.get_value(
                 sid,
                 Timestamp('2015-11-30 21:01:00', tz='UTC'),
-                'open'),
-            600)
+                'open'
+            )
 
     def test_set_sid_attrs(self):
         """Confirm that we can set the attributes of a sid's file correctly.
@@ -931,3 +1002,217 @@ class BcolzMinuteBarTestCase(WithTradingCalendars,
         # Read the attributes
         for k, v in attrs.items():
             self.assertEqual(self.reader.get_sid_attr(sid, k), v)
+
+    def test_truncate_between_data_points(self):
+
+        tds = self.market_opens.index
+        days = tds[tds.slice_indexer(
+            start=self.test_calendar_start + 1,
+            end=self.test_calendar_start + 3
+        )]
+        minutes = DatetimeIndex([
+            self.market_opens[days[0]] + timedelta(minutes=60),
+            self.market_opens[days[1]] + timedelta(minutes=120),
+        ])
+        sid = 1
+        data = DataFrame(
+            data={
+                'open': [10.0, 11.0],
+                'high': [20.0, 21.0],
+                'low': [30.0, 31.0],
+                'close': [40.0, 41.0],
+                'volume': [50.0, 51.0]
+            },
+            index=minutes)
+        self.writer.write_sid(sid, data)
+
+        # Open a new writer to cover `open` method, also truncating only
+        # applies to an existing directory.
+        writer = BcolzMinuteBarWriter.open(self.dest)
+
+        # Truncate to first day with data.
+        writer.truncate(days[0])
+
+        # Refresh the reader since truncate update the metadata.
+        self.reader = BcolzMinuteBarReader(self.dest)
+
+        self.assertEqual(self.writer.last_date_in_output_for_sid(sid), days[0])
+
+        cal = self.trading_calendar
+        _, last_close = cal.open_and_close_for_session(days[0])
+        self.assertEqual(self.reader.last_available_dt, last_close)
+
+        minute = minutes[0]
+
+        open_price = self.reader.get_value(sid, minute, 'open')
+
+        self.assertEquals(10.0, open_price)
+
+        high_price = self.reader.get_value(sid, minute, 'high')
+
+        self.assertEquals(20.0, high_price)
+
+        low_price = self.reader.get_value(sid, minute, 'low')
+
+        self.assertEquals(30.0, low_price)
+
+        close_price = self.reader.get_value(sid, minute, 'close')
+
+        self.assertEquals(40.0, close_price)
+
+        volume_price = self.reader.get_value(sid, minute, 'volume')
+
+        self.assertEquals(50.0, volume_price)
+
+    def test_truncate_all_data_points(self):
+
+        tds = self.market_opens.index
+        days = tds[tds.slice_indexer(
+            start=self.test_calendar_start + 1,
+            end=self.test_calendar_start + 3
+        )]
+        minutes = DatetimeIndex([
+            self.market_opens[days[0]] + timedelta(minutes=60),
+            self.market_opens[days[1]] + timedelta(minutes=120),
+        ])
+        sid = 1
+        data = DataFrame(
+            data={
+                'open': [10.0, 11.0],
+                'high': [20.0, 21.0],
+                'low': [30.0, 31.0],
+                'close': [40.0, 41.0],
+                'volume': [50.0, 51.0]
+            },
+            index=minutes)
+        self.writer.write_sid(sid, data)
+
+        # Truncate to first day in the calendar, a day before the first
+        # day with minute data.
+        self.writer.truncate(self.test_calendar_start)
+
+        # Refresh the reader since truncate update the metadata.
+        self.reader = BcolzMinuteBarReader(self.dest)
+
+        self.assertEqual(
+            self.writer.last_date_in_output_for_sid(sid),
+            self.test_calendar_start,
+        )
+
+        cal = self.trading_calendar
+        _, last_close = cal.open_and_close_for_session(
+            self.test_calendar_start)
+        self.assertEqual(self.reader.last_available_dt, last_close)
+
+    def test_early_market_close(self):
+        # Date to test is 2015-11-30 9:31
+        # Early close is 2015-11-27 18:00
+        friday_after_tday = Timestamp('2015-11-27', tz='UTC')
+        friday_after_tday_close = self.market_closes[friday_after_tday]
+
+        before_early_close = friday_after_tday_close - timedelta(minutes=8)
+        after_early_close = friday_after_tday_close + timedelta(minutes=8)
+
+        monday_after_tday = Timestamp('2015-11-30', tz='UTC')
+        minute = self.market_opens[monday_after_tday]
+
+        # Test condition where there is data written after the market
+        # close (ideally, this should not occur in datasets, but guards
+        # against consumers of the minute bar writer, which do not filter
+        # out after close minutes.
+        minutes = [
+            before_early_close,
+            after_early_close,
+            minute,
+        ]
+        sid = 1
+        data = DataFrame(
+            data={
+                'open': [10.0, 11.0, nan],
+                'high': [20.0, 21.0, nan],
+                'low': [30.0, 31.0, nan],
+                'close': [40.0, 41.0, nan],
+                'volume': [50, 51, 0]
+            },
+            index=[minutes])
+        self.writer.write_sid(sid, data)
+
+        open_price = self.reader.get_value(sid, minute, 'open')
+
+        assert_almost_equal(nan, open_price)
+
+        high_price = self.reader.get_value(sid, minute, 'high')
+
+        assert_almost_equal(nan, high_price)
+
+        low_price = self.reader.get_value(sid, minute, 'low')
+
+        assert_almost_equal(nan, low_price)
+
+        close_price = self.reader.get_value(sid, minute, 'close')
+
+        assert_almost_equal(nan, close_price)
+
+        volume = self.reader.get_value(sid, minute, 'volume')
+
+        self.assertEquals(0, volume)
+
+        asset = self.asset_finder.retrieve_asset(sid)
+        last_traded_dt = self.reader.get_last_traded_dt(asset, minute)
+
+        self.assertEquals(last_traded_dt, before_early_close,
+                          "The last traded dt should be before the early "
+                          "close, even when data is written between the early "
+                          "close and the next open.")
+
+    def test_minute_updates(self):
+        """
+        Test minute updates.
+        """
+        start_minute = self.market_opens[TEST_CALENDAR_START]
+        minutes = [start_minute,
+                   start_minute + Timedelta('1 min'),
+                   start_minute + Timedelta('2 min')]
+        sids = [1, 2]
+        data_1 = DataFrame(
+            data={
+                'open': [15.0, nan, 15.1],
+                'high': [17.0, nan, 17.1],
+                'low': [11.0, nan, 11.1],
+                'close': [14.0, nan, 14.1],
+                'volume': [1000, 0, 1001]
+            },
+            index=minutes)
+
+        data_2 = DataFrame(
+            data={
+                'open': [25.0, nan, 25.1],
+                'high': [27.0, nan, 27.1],
+                'low': [21.0, nan, 21.1],
+                'close': [24.0, nan, 24.1],
+                'volume': [2000, 0, 2001]
+            },
+            index=minutes)
+
+        frames = {1: data_1, 2: data_2}
+        update_path = self.instance_tmpdir.getpath('updates.h5')
+        update_writer = H5MinuteBarUpdateWriter(update_path)
+        update_writer.write(frames)
+
+        update_reader = H5MinuteBarUpdateReader(update_path)
+        self.writer.write(update_reader.read(minutes, sids))
+
+        # Refresh the reader since truncate update the metadata.
+        reader = BcolzMinuteBarReader(self.dest)
+
+        columns = ['open', 'high', 'low', 'close', 'volume']
+        sids = [sids[0], sids[1]]
+        arrays = list(map(transpose, reader.load_raw_arrays(
+            columns, minutes[0], minutes[-1], sids,
+        )))
+
+        data = {sids[0]: data_1, sids[1]: data_2}
+
+        for i, col in enumerate(columns):
+            for j, sid in enumerate(sids):
+                assert_almost_equal(data[sid][col], arrays[i][j])

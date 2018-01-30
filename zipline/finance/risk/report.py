@@ -68,8 +68,7 @@ log = logbook.Logger('Risk Report')
 
 class RiskReport(object):
     def __init__(self, algorithm_returns, sim_params, trading_calendar,
-                 treasury_curves, benchmark_returns,
-                 algorithm_leverages=None):
+                 benchmark_returns, algorithm_leverages=None):
         """
         algorithm_returns needs to be a list of daily_return objects
         sorted in date ascending order
@@ -81,7 +80,6 @@ class RiskReport(object):
         self.algorithm_returns = algorithm_returns
         self.sim_params = sim_params
         self.trading_calendar = trading_calendar
-        self.treasury_curves = treasury_curves
         self.benchmark_returns = benchmark_returns
         self.algorithm_leverages = algorithm_leverages
 
@@ -113,7 +111,7 @@ class RiskReport(object):
             - 6_month
             - 12_month
 
-        The return value of this funciton is a dictionary keyed by the above
+        The return value of this function is a dictionary keyed by the above
         list of durations. The value of each entry is a list of RiskMetric
         dicts of the same duration as denoted by the top_level key.
 
@@ -151,7 +149,6 @@ class RiskReport(object):
                 returns=self.algorithm_returns,
                 benchmark_returns=self.benchmark_returns,
                 trading_calendar=self.trading_calendar,
-                treasury_curves=self.treasury_curves,
                 algorithm_leverages=self.algorithm_leverages,
             )
 

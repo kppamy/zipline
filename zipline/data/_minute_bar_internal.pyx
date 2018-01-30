@@ -38,7 +38,8 @@ def minute_value(ndarray[long_t, ndim=1] market_opens,
 def find_position_of_minute(ndarray[long_t, ndim=1] market_opens,
                             ndarray[long_t, ndim=1] market_closes,
                             long_t minute_val,
-                            short minutes_per_day):
+                            short minutes_per_day,
+                            bool forward_fill):
     """
     Finds the position of a given minute in the given array of market opens.
     If not a market minute, adjusts to the last market minute.
@@ -57,9 +58,21 @@ def find_position_of_minute(ndarray[long_t, ndim=1] market_opens,
     minutes_per_day: int
         The number of minutes per day (e.g. 390 for NYSE).
 
+    forward_fill: bool
+        Whether to use the previous market minute if the given minute does
+        not fall within an open/close pair.
+
     Returns
     -------
     int: The position of the given minute in the market opens array.
+
+    Raises
+    ------
+    ValueError
+        If the given minute is not between a single open/close pair AND
+        forward_fill is False.  For example, if minute_val is 17:00 Eastern
+        for a given day whose normal hours are 9:30 to 16:00, and we are not
+        forward filling, ValueError is raised.
     """
     cdef Py_ssize_t market_open_loc, market_open, delta
 
@@ -67,6 +80,9 @@ def find_position_of_minute(ndarray[long_t, ndim=1] market_opens,
         searchsorted(market_opens, minute_val, side='right') - 1
     market_open = market_opens[market_open_loc]
     market_close = market_closes[market_open_loc]
+
+    if not forward_fill and ((minute_val - market_open) >= minutes_per_day):
+        raise ValueError("Given minute is not between an open and a close")
 
     delta = int_min(minute_val - market_open, market_close - market_open)
 
@@ -108,11 +124,11 @@ def find_last_traded_position_internal(
     -------
     int: The position of the last traded minute, starting from `minute_val`
     """
-    cdef Py_ssize_t minute_pos, current_minute
+    cdef Py_ssize_t minute_pos, current_minute, q
 
     minute_pos = int_min(
         find_position_of_minute(market_opens, market_closes, end_minute,
-                                minutes_per_day),
+                                minutes_per_day, True),
         len(volumes) - 1
     )
 
@@ -120,6 +136,15 @@ def find_last_traded_position_internal(
         current_minute = minute_value(
             market_opens, minute_pos, minutes_per_day
         )
+
+        q = cython.cdiv(minute_pos, minutes_per_day)
+        if current_minute > market_closes[q]:
+            minute_pos = find_position_of_minute(market_opens,
+                                                 market_closes,
+                                                 market_closes[q],
+                                                 minutes_per_day,
+                                                 False)
+            continue
 
         if current_minute < start_minute:
             return -1

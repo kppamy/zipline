@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from sys import maxsize
+import re
 
 from nose_parameterized import parameterized
 from numpy import (
     arange,
     datetime64,
+    nan,
 )
 from numpy.testing import (
     assert_array_equal,
@@ -30,7 +32,9 @@ from pandas.util.testing import assert_index_equal
 
 from zipline.data.us_equity_pricing import (
     BcolzDailyBarReader,
-    NoDataOnDate,
+    BcolzDailyBarWriter,
+    NoDataBeforeDate,
+    NoDataAfterDate,
 )
 from zipline.pipeline.loaders.synthetic import (
     OHLCV,
@@ -42,7 +46,10 @@ from zipline.pipeline.loaders.synthetic import (
 )
 from zipline.testing import seconds_to_timestamp
 from zipline.testing.fixtures import (
+    WithAssetFinder,
     WithBcolzEquityDailyBarReader,
+    WithTmpDir,
+    WithTradingCalendars,
     ZiplineTestCase,
 )
 from zipline.utils.calendars import get_calendar
@@ -285,45 +292,45 @@ class BcolzDailyBarTestCase(WithBcolzEquityDailyBarReader, ZiplineTestCase):
                 end_date=self.asset_end(asset),
             )
 
-    def test_unadjusted_spot_price(self):
+    def test_unadjusted_get_value(self):
         reader = self.bcolz_equity_daily_bar_reader
         # At beginning
-        price = reader.spot_price(1, Timestamp('2015-06-01', tz='UTC'),
-                                  'close')
+        price = reader.get_value(1, Timestamp('2015-06-01', tz='UTC'),
+                                 'close')
         # Synthetic writes price for date.
         self.assertEqual(108630.0, price)
 
         # Middle
-        price = reader.spot_price(1, Timestamp('2015-06-02', tz='UTC'),
-                                  'close')
+        price = reader.get_value(1, Timestamp('2015-06-02', tz='UTC'),
+                                 'close')
         self.assertEqual(108631.0, price)
         # End
-        price = reader.spot_price(1, Timestamp('2015-06-05', tz='UTC'),
-                                  'close')
+        price = reader.get_value(1, Timestamp('2015-06-05', tz='UTC'),
+                                 'close')
         self.assertEqual(108634.0, price)
 
         # Another sid at beginning.
-        price = reader.spot_price(2, Timestamp('2015-06-22', tz='UTC'),
-                                  'close')
+        price = reader.get_value(2, Timestamp('2015-06-22', tz='UTC'),
+                                 'close')
         self.assertEqual(208651.0, price)
 
         # Ensure that volume does not have float adjustment applied.
-        volume = reader.spot_price(1, Timestamp('2015-06-02', tz='UTC'),
-                                   'volume')
+        volume = reader.get_value(1, Timestamp('2015-06-02', tz='UTC'),
+                                  'volume')
         self.assertEqual(109631, volume)
 
-    def test_unadjusted_spot_price_no_data(self):
+    def test_unadjusted_get_value_no_data(self):
         table = self.bcolz_daily_bar_ctable
         reader = BcolzDailyBarReader(table)
         # before
-        with self.assertRaises(NoDataOnDate):
-            reader.spot_price(2, Timestamp('2015-06-08', tz='UTC'), 'close')
+        with self.assertRaises(NoDataBeforeDate):
+            reader.get_value(2, Timestamp('2015-06-08', tz='UTC'), 'close')
 
         # after
-        with self.assertRaises(NoDataOnDate):
-            reader.spot_price(4, Timestamp('2015-06-16', tz='UTC'), 'close')
+        with self.assertRaises(NoDataAfterDate):
+            reader.get_value(4, Timestamp('2015-06-16', tz='UTC'), 'close')
 
-    def test_unadjusted_spot_price_empty_value(self):
+    def test_unadjusted_get_value_empty_value(self):
         reader = self.bcolz_equity_daily_bar_reader
 
         # A sid, day and corresponding index into which to overwrite a zero.
@@ -338,8 +345,8 @@ class BcolzDailyBarTestCase(WithBcolzEquityDailyBarReader, ZiplineTestCase):
             # This a little hacky, in lieu of changing the synthetic data set.
             reader._spot_col('close')[zero_ix] = 0
 
-            close = reader.spot_price(zero_sid, zero_day, 'close')
-            self.assertEqual(-1, close)
+            close = reader.get_value(zero_sid, zero_day, 'close')
+            assert_array_equal(nan, close)
         finally:
             reader._spot_col('close')[zero_ix] = old
 
@@ -360,3 +367,45 @@ class BcolzDailyBarNeverReadAllTestCase(BcolzDailyBarTestCase):
     `load_raw_array`.
     """
     BCOLZ_DAILY_BAR_READ_ALL_THRESHOLD = maxsize
+
+
+class BcolzDailyBarWriterMissingDataTestCase(WithAssetFinder,
+                                             WithTmpDir,
+                                             WithTradingCalendars,
+                                             ZiplineTestCase):
+    # Sid 3 is active from 2015-06-02 to 2015-06-30.
+    MISSING_DATA_SID = 3
+    # Leave out data for a day in the middle of the query range.
+    MISSING_DATA_DAY = Timestamp('2015-06-15', tz='UTC')
+
+    @classmethod
+    def make_equity_info(cls):
+        return EQUITY_INFO.loc[EQUITY_INFO.index == cls.MISSING_DATA_SID]
+
+    def test_missing_values_assertion(self):
+        sessions = self.trading_calendar.sessions_in_range(
+            TEST_CALENDAR_START,
+            TEST_CALENDAR_STOP,
+        )
+
+        sessions_with_gap = sessions[sessions != self.MISSING_DATA_DAY]
+        bar_data = make_bar_data(self.make_equity_info(), sessions_with_gap)
+
+        writer = BcolzDailyBarWriter(
+            self.tmpdir.path,
+            self.trading_calendar,
+            sessions[0],
+            sessions[-1],
+        )
+
+        # There are 21 sessions between the start and end date for this
+        # asset, and we excluded one.
+        expected_msg = re.escape(
+            "Got 20 rows for daily bars table with first day=2015-06-02, last "
+            "day=2015-06-30, expected 21 rows.\n"
+            "Missing sessions: "
+            "[Timestamp('2015-06-15 00:00:00+0000', tz='UTC')]\n"
+            "Extra sessions: []"
+        )
+        with self.assertRaisesRegexp(AssertionError, expected_msg):
+            writer.write(bar_data)

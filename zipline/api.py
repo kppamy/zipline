@@ -16,6 +16,12 @@
 # Note that part of the API is implemented in TradingAlgorithm as
 # methods (e.g. order). These are added to this namespace via the
 # decorator ``api_method`` inside of algorithm.py.
+from .finance.asset_restrictions import (
+    Restriction,
+    StaticRestrictions,
+    HistoricalRestrictions,
+    RESTRICTION_STATES,
+)
 from .finance import commission, execution, slippage, cancel_policy
 from .finance.cancel_policy import (
     NeverCancel,
@@ -23,10 +29,12 @@ from .finance.cancel_policy import (
 )
 from .finance.slippage import (
     FixedSlippage,
+    FixedBasisPointsSlippage,
     VolumeShareSlippage,
 )
 from .utils import math_utils, events
 from .utils.events import (
+    calendars,
     date_rules,
     time_rules
 )
@@ -34,8 +42,13 @@ from .utils.events import (
 __all__ = [
     'EODCancel',
     'FixedSlippage',
+    'FixedBasisPointsSlippage',
     'NeverCancel',
     'VolumeShareSlippage',
+    'Restriction',
+    'StaticRestrictions',
+    'HistoricalRestrictions',
+    'RESTRICTION_STATES',
     'cancel_policy',
     'commission',
     'date_rules',
@@ -43,5 +56,6 @@ __all__ = [
     'execution',
     'math_utils',
     'slippage',
-    'time_rules'
+    'time_rules',
+    'calendars',
 ]

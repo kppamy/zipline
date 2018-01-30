@@ -1,13 +1,21 @@
 """
 Utilities for working with pandas objects.
 """
+from contextlib import contextmanager
+from copy import deepcopy
 from itertools import product
 import operator as op
+import warnings
 
+import numpy as np
 import pandas as pd
 from distutils.version import StrictVersion
 
 pandas_version = StrictVersion(pd.__version__)
+
+
+def july_5th_holiday_observance(datetime_index):
+    return datetime_index[datetime_index.year != 2013]
 
 
 def explode(df):
@@ -17,19 +25,6 @@ def explode(df):
     (df.index, df.columns, df.values)
     """
     return df.index, df.columns, df.values
-
-
-try:
-    # This branch is hit in pandas 17
-    sort_values = pd.DataFrame.sort_values
-except AttributeError:
-    # This branch is hit in pandas 16
-    sort_values = pd.DataFrame.sort
-
-if pandas_version >= StrictVersion('0.17.1'):
-    july_5th_holiday_observance = lambda dtix: dtix[dtix.year != 2013]
-else:
-    july_5th_holiday_observance = lambda dt: None if dt.year == 2013 else dt
 
 
 def _time_to_micros(time):
@@ -98,6 +93,37 @@ def mask_between_time(dts, start, end, include_start=True, include_end=True):
     )
 
 
+def find_in_sorted_index(dts, dt):
+    """
+    Find the index of ``dt`` in ``dts``.
+
+    This function should be used instead of `dts.get_loc(dt)` if the index is
+    large enough that we don't want to initialize a hash table in ``dts``. In
+    particular, this should always be used on minutely trading calendars.
+
+    Parameters
+    ----------
+    dts : pd.DatetimeIndex
+        Index in which to look up ``dt``. **Must be sorted**.
+    dt : pd.Timestamp
+        ``dt`` to be looked up.
+
+    Returns
+    -------
+    ix : int
+        Integer index such that dts[ix] == dt.
+
+    Raises
+    ------
+    KeyError
+        If dt is not in ``dts``.
+    """
+    ix = dts.searchsorted(dt)
+    if dts[ix] != dt:
+        raise LookupError("{dt} is not in {dts}".format(dt=dt, dts=dts))
+    return ix
+
+
 def nearest_unequal_elements(dts, dt):
     """
     Find values in ``dts`` closest but not equal to ``dt``.
@@ -146,3 +172,178 @@ def nearest_unequal_elements(dts, dt):
     upper_value = dts[upper_ix] if upper_ix < len(dts) else None
 
     return lower_value, upper_value
+
+
+def timedelta_to_integral_seconds(delta):
+    """
+    Convert a pd.Timedelta to a number of seconds as an int.
+    """
+    return int(delta.total_seconds())
+
+
+def timedelta_to_integral_minutes(delta):
+    """
+    Convert a pd.Timedelta to a number of minutes as an int.
+    """
+    return timedelta_to_integral_seconds(delta) // 60
+
+
+@contextmanager
+def ignore_pandas_nan_categorical_warning():
+    with warnings.catch_warnings():
+        # Pandas >= 0.18 doesn't like null-ish values in catgories, but
+        # avoiding that requires a broader change to how missing values are
+        # handled in pipeline, so for now just silence the warning.
+        warnings.filterwarnings(
+            'ignore',
+            category=FutureWarning,
+        )
+        yield
+
+
+_INDEXER_NAMES = [
+    '_' + name for (name, _) in pd.core.indexing.get_indexers_list()
+]
+
+
+def clear_dataframe_indexer_caches(df):
+    """
+    Clear cached attributes from a pandas DataFrame.
+
+    By default pandas memoizes indexers (`iloc`, `loc`, `ix`, etc.) objects on
+    DataFrames, resulting in refcycles that can lead to unexpectedly long-lived
+    DataFrames. This function attempts to clear those cycles by deleting the
+    cached indexers from the frame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    """
+    for attr in _INDEXER_NAMES:
+        try:
+            delattr(df, attr)
+        except AttributeError:
+            pass
+
+
+def categorical_df_concat(df_list, inplace=False):
+    """
+    Prepare list of pandas DataFrames to be used as input to pd.concat.
+    Ensure any columns of type 'category' have the same categories across each
+    dataframe.
+
+    Parameters
+    ----------
+    df_list : list
+        List of dataframes with same columns.
+    inplace : bool
+        True if input list can be modified. Default is False.
+
+    Returns
+    -------
+    concatenated : df
+        Dataframe of concatenated list.
+    """
+
+    if not inplace:
+        df_list = deepcopy(df_list)
+
+    # Assert each dataframe has the same columns/dtypes
+    df = df_list[0]
+    if not all([(df.dtypes.equals(df_i.dtypes)) for df_i in df_list[1:]]):
+        raise ValueError("Input DataFrames must have the same columns/dtypes.")
+
+    categorical_columns = df.columns[df.dtypes == 'category']
+
+    for col in categorical_columns:
+        new_categories = sorted(
+            set().union(
+                *(frame[col].cat.categories for frame in df_list)
+            )
+        )
+
+        with ignore_pandas_nan_categorical_warning():
+            for df in df_list:
+                df[col].cat.set_categories(new_categories, inplace=True)
+
+    return pd.concat(df_list)
+
+
+def days_at_time(days, t, tz, day_offset=0):
+    """
+    Create an index of days at time ``t``, interpreted in timezone ``tz``.
+
+    The returned index is localized to UTC.
+
+    Parameters
+    ----------
+    days : DatetimeIndex
+        An index of dates (represented as midnight).
+    t : datetime.time
+        The time to apply as an offset to each day in ``days``.
+    tz : pytz.timezone
+        The timezone to use to interpret ``t``.
+    day_offset : int
+        The number of days we want to offset @days by
+
+    Examples
+    --------
+    In the example below, the times switch from 13:45 to 12:45 UTC because
+    March 13th is the daylight savings transition for US/Eastern.  All the
+    times are still 8:45 when interpreted in US/Eastern.
+
+    >>> import pandas as pd; import datetime; import pprint
+    >>> dts = pd.date_range('2016-03-12', '2016-03-14')
+    >>> dts_at_845 = days_at_time(dts, datetime.time(8, 45), 'US/Eastern')
+    >>> pprint.pprint([str(dt) for dt in dts_at_845])
+    ['2016-03-12 13:45:00+00:00',
+     '2016-03-13 12:45:00+00:00',
+     '2016-03-14 12:45:00+00:00']
+    """
+    if len(days) == 0:
+        return days
+
+    # Offset days without tz to avoid timezone issues.
+    days = pd.DatetimeIndex(days).tz_localize(None)
+    delta = pd.Timedelta(
+        days=day_offset,
+        hours=t.hour,
+        minutes=t.minute,
+        seconds=t.second,
+    )
+    return (days + delta).tz_localize(tz).tz_convert('UTC')
+
+
+def empty_dataframe(*columns):
+    """Create an empty dataframe with columns of particular types.
+
+    Parameters
+    ----------
+    *columns
+        The (column_name, column_dtype) pairs.
+
+    Returns
+    -------
+    typed_dataframe : pd.DataFrame
+        The empty typed dataframe.
+
+    Examples
+    --------
+    >>> df = empty_dataframe(
+    ...     ('a', 'int64'),
+    ...     ('b', 'float64'),
+    ...     ('c', 'datetime64[ns]'),
+    ... )
+
+    >>> df
+    Empty DataFrame
+    Columns: [a, b, c]
+    Index: []
+
+    df.dtypes
+    a             int64
+    b           float64
+    c    datetime64[ns]
+    dtype: object
+    """
+    return pd.DataFrame(np.array([], dtype=list(columns)))

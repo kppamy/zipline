@@ -27,18 +27,25 @@ from pandas import read_csv
 from pandas.tslib import Timedelta
 from pandas.util.testing import assert_index_equal
 from pytz import timezone
+from toolz import concat
 
 from zipline.errors import (
     CalendarNameCollision,
     InvalidCalendarName,
 )
 
-from zipline.utils.calendars import(
-    register_calendar,
+from zipline.testing.predicates import assert_equal
+from zipline.utils.calendars import (
     deregister_calendar,
     get_calendar,
+    register_calendar,
 )
-from zipline.utils.calendars.calendar_utils import register_calendar_type
+from zipline.utils.calendars.calendar_utils import (
+    _default_calendar_aliases,
+    _default_calendar_factories,
+    register_calendar_type,
+
+)
 from zipline.utils.calendars.trading_calendar import days_at_time, \
     TradingCalendar
 
@@ -117,6 +124,14 @@ class CalendarRegistrationTestCase(TestCase):
         second_dummy = get_calendar("DMY")
 
         self.assertNotEqual(first_dummy, second_dummy)
+
+
+class DefaultsTestCase(TestCase):
+    def test_default_calendars(self):
+        for name in concat([_default_calendar_factories,
+                            _default_calendar_aliases]):
+            self.assertIsNotNone(get_calendar(name),
+                                 "get_calendar(%r) returned None" % name)
 
 
 class DaysAtTimeTestCase(TestCase):
@@ -432,6 +447,24 @@ class ExchangeCalendarTestBase(object):
                         direction="none"
                     )
 
+    @parameterized.expand([
+        (1, 0),
+        (2, 0),
+        (2, 1),
+    ])
+    def test_minute_index_to_session_labels(self, interval, offset):
+        minutes = self.calendar.minutes_for_sessions_in_range(
+            pd.Timestamp('2011-01-04', tz='UTC'),
+            pd.Timestamp('2011-04-04', tz='UTC'),
+        )
+        minutes = minutes[range(offset, len(minutes), interval)]
+
+        np.testing.assert_array_equal(
+            np.array(minutes.map(self.calendar.minute_to_session_label),
+                     dtype='datetime64[ns]'),
+            self.calendar.minute_index_to_session_labels(minutes)
+        )
+
     def test_next_prev_session(self):
         session_labels = self.answers.index[1:-2]
         max_idx = len(session_labels) - 1
@@ -503,7 +536,7 @@ class ExchangeCalendarTestBase(object):
         # pick two sessions
         session_count = len(self.calendar.schedule.index)
 
-        first_idx = session_count / 3
+        first_idx = session_count // 3
         second_idx = 2 * first_idx
 
         first_session_label = self.calendar.schedule.index[first_idx]
@@ -640,8 +673,32 @@ class ExchangeCalendarTestBase(object):
             found_open, found_close = \
                 self.calendar.open_and_close_for_session(session_label)
 
+            # Test that the methods for just session open and close produce the
+            # same values as the method for getting both.
+            alt_open = self.calendar.session_open(session_label)
+            self.assertEqual(alt_open, found_open)
+
+            alt_close = self.calendar.session_close(session_label)
+            self.assertEqual(alt_close, found_close)
+
             self.assertEqual(open_answer, found_open)
             self.assertEqual(close_answer, found_close)
+
+    def test_session_opens_in_range(self):
+        found_opens = self.calendar.session_opens_in_range(
+            self.answers.index[0],
+            self.answers.index[-1],
+        )
+
+        assert_equal(found_opens, self.answers['market_open'])
+
+    def test_session_closes_in_range(self):
+        found_closes = self.calendar.session_closes_in_range(
+            self.answers.index[0],
+            self.answers.index[-1],
+        )
+
+        assert_equal(found_closes, self.answers['market_close'])
 
     def test_daylight_savings(self):
         # 2004 daylight savings switches:

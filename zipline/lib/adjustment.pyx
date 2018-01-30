@@ -1,19 +1,14 @@
 # cython: embedsignature=True
 from cpython cimport Py_EQ
 
+cimport cython
 from pandas import isnull, Timestamp
+cimport numpy as np
 from numpy cimport float64_t, uint8_t, int64_t
-from numpy import datetime64, float64
-# Purely for readability. There aren't C-level declarations for these types.
-ctypedef object Int64Index_t
-ctypedef object DatetimeIndex_t
-ctypedef object Timestamp_t
+from numpy import asarray, datetime64, float64, int64, bool_, uint8
 
-# Adjustment kinds.
-cpdef enum AdjustmentKind:
-    MULTIPLY = 0
-    ADD = 1
-    OVERWRITE = 2
+from zipline.utils.compat import unicode
+
 
 ADJUSTMENT_KIND_NAMES = {
     MULTIPLY: 'MULTIPLY',
@@ -29,12 +24,35 @@ cdef dict _float_adjustment_types = {
 cdef dict _datetime_adjustment_types = {
     OVERWRITE: Datetime64Overwrite,
 }
+cdef dict _object_adjustment_types = {
+    OVERWRITE: ObjectOverwrite,
+}
+cdef dict _int_adjustment_types = {
+    OVERWRITE: Int64Overwrite,
+}
+cdef dict _boolean_adjustment_types = {
+    OVERWRITE: BooleanOverwrite,
+}
+
 
 cdef _is_float(object value):
     return isinstance(value, (float, float64))
 
-def _is_datetime(object value):
+
+cdef _is_datetime(object value):
     return isinstance(value, (datetime64, Timestamp))
+
+
+cdef _is_int(object value):
+    return isinstance(value, (int, int64))
+
+
+cdef _is_obj(object value):
+    return isinstance(value, (bytes, unicode, type(None)))
+
+
+cdef _is_bool(object value):
+    return isinstance(value, (bool, bool_, uint8))
 
 
 cpdef choose_adjustment_type(AdjustmentKind adjustment_kind, object value):
@@ -67,25 +85,82 @@ cpdef choose_adjustment_type(AdjustmentKind adjustment_kind, object value):
             return _float_adjustment_types[adjustment_kind]
         elif _is_datetime(value):
             return _datetime_adjustment_types[adjustment_kind]
+        elif _is_bool(value):
+            return _boolean_adjustment_types[adjustment_kind]
+        elif _is_int(value):
+            return _int_adjustment_types[adjustment_kind]
+        elif _is_obj(value):
+            return _object_adjustment_types[adjustment_kind]
         else:
             raise TypeError(
                 "Don't know how to make overwrite "
                 "adjustments for values of type %r." % type(value),
             )
+
     else:
         raise ValueError("Unknown adjustment type %d." % adjustment_kind)
 
 
-cpdef make_adjustment_from_indices(Py_ssize_t first_row,
-                                   Py_ssize_t last_row,
-                                   Py_ssize_t first_column,
-                                   Py_ssize_t last_column,
-                                   AdjustmentKind adjustment_kind,
-                                   object value):
+cpdef Adjustment make_adjustment_from_indices(Py_ssize_t first_row,
+                                              Py_ssize_t last_row,
+                                              Py_ssize_t first_column,
+                                              Py_ssize_t last_column,
+                                              AdjustmentKind adjustment_kind,
+                                              object value):
     """
     Make an Adjustment object from row/column indices into a baseline array.
     """
     cdef type type_ = choose_adjustment_type(adjustment_kind, value)
+    # NOTE_SS: Cython appears to generate incorrect code here if values are
+    # passed by name.  This is true even if cython.always_allow_keywords is
+    # enabled.  Yay Cython.
+    return type_(first_row, last_row, first_column, last_column, value)
+
+
+cdef type _choose_adjustment_type(AdjustmentKind adjustment_kind,
+                                  column_type value):
+    if adjustment_kind in (ADD, MULTIPLY):
+        if column_type is np.float64_t:
+            return _float_adjustment_types[adjustment_kind]
+
+        raise TypeError(
+            "Can't construct %s Adjustment with value of type %r.\n"
+            "ADD and MULTIPLY adjustments are only supported for "
+            "floating point data." % (
+                ADJUSTMENT_KIND_NAMES[adjustment_kind],
+                type(value),
+            )
+        )
+
+    elif adjustment_kind == OVERWRITE:
+        if column_type is np.float64_t:
+            return _float_adjustment_types[adjustment_kind]
+        elif column_type is np.int64_t:
+            return _int_adjustment_types[adjustment_kind]
+        elif column_type is np.uint8_t:
+            return _boolean_adjustment_types[adjustment_kind]
+        elif column_type is object:
+            return _object_adjustment_types[adjustment_kind]
+        else:
+            raise TypeError(
+                "Don't know how to make overwrite "
+                "adjustments for values of type %r." % type(value),
+            )
+
+    else:
+        raise ValueError("Unknown adjustment type %d." % adjustment_kind)
+
+
+cdef Adjustment make_adjustment_from_indices_fused(Py_ssize_t first_row,
+                                                   Py_ssize_t last_row,
+                                                   Py_ssize_t first_column,
+                                                   Py_ssize_t last_column,
+                                                   AdjustmentKind adjustment_kind,
+                                                   column_type value):
+    """
+    Make an Adjustment object from row/column indices into a baseline array.
+    """
+    cdef type type_ = _choose_adjustment_type(adjustment_kind, value)
     # NOTE_SS: Cython appears to generate incorrect code here if values are
     # passed by name.  This is true even if cython.always_allow_keywords is
     # enabled.  Yay Cython.
@@ -206,18 +281,30 @@ cdef class Adjustment:
     """
     Base class for Adjustments.
 
-    Subclasses should inherit and provide a `value` attribute and a `mutate` method.
+    Subclasses should inherit and provide a `value` attribute and a `mutate`
+    method.
     """
-    cdef:
-        readonly Py_ssize_t first_col, last_col, first_row, last_row
-
     def __init__(self,
                  Py_ssize_t first_row,
                  Py_ssize_t last_row,
                  Py_ssize_t first_col,
                  Py_ssize_t last_col):
-        assert 0 <= first_row <= last_row
-        assert 0 <= first_col <= last_col
+        if not (0 <= first_row <= last_row):
+            raise ValueError(
+                'first_row must be in the range [0, last_row], got:'
+                ' first_row=%s last_row=%s' % (
+                    first_row,
+                    last_row,
+                ),
+            )
+        if not (0 <= first_col <= last_col):
+            raise ValueError(
+                'first_col must be in the range [0, last_col], got:'
+                ' first_col=%s last_col=%s' % (
+                    first_col,
+                    last_col,
+                ),
+            )
 
         self.first_col = first_col
         self.last_col = last_col
@@ -247,14 +334,14 @@ cdef class Adjustment:
             self.value,
         )
 
+    def __reduce__(self):
+        return type(self), self._key()
+
 
 cdef class Float64Adjustment(Adjustment):
     """
     Base class for adjustments that operate on Float64 data.
     """
-    cdef:
-        readonly float64_t value
-
     def __init__(self,
                  Py_ssize_t first_row,
                  Py_ssize_t last_row,
@@ -364,6 +451,153 @@ cdef class Float64Overwrite(Float64Adjustment):
                 data[row, col] = value
 
 
+cdef class ArrayAdjustment(Adjustment):
+    """
+    Base class for ArrayAdjustments.
+
+    Subclasses should inherit and provide a `values` attribute and a `mutate`
+    method.
+    """
+    def __repr__(self):
+            return (
+                "%s(first_row=%d, last_row=%d,"
+                " first_col=%d, last_col=%d, values=%s)" % (
+                    type(self).__name__,
+                    self.first_row,
+                    self.last_row,
+                    self.first_col,
+                    self.last_col,
+                    asarray(self.values),
+                )
+            )
+
+cdef class Float641DArrayOverwrite(ArrayAdjustment):
+    """
+    An adjustment that overwrites subarrays with a value for each subarray.
+
+    Example
+    -------
+
+    >>> import numpy as np
+    >>> arr = np.arange(25, dtype=float).reshape(5, 5)
+    >>> arr
+    array([[  0.,   1.,   2.,   3.,   4.],
+           [  5.,   6.,   7.,   8.,   9.],
+           [ 10.,  11.,  12.,  13.,  14.],
+           [ 15.,  16.,  17.,  18.,  19.],
+           [ 20.,  21.,  22.,  23.,  24.]])
+    >>> adj = Float641DArrayOverwrite(
+    ...     row_start=0,
+    ...     row_end=3,
+    ...     column_start=0,
+    ...     column_end=0,
+    ...     values=np.array([1, 2, 3, 4]),
+    )
+    >>> adj.mutate(arr)
+    >>> arr
+    array([[  1.,   1.,   2.,   3.,   4.],
+           [  2.,   6.,   7.,   8.,   9.],
+           [ 3.,  11.,  12.,  13.,  14.],
+           [ 4.,  16.,  17.,  18.,  19.],
+           [ 20.,  21.,  22.,  23.,  24.]])
+    """
+    def __init__(self,
+                 int64_t first_row,
+                 int64_t last_row,
+                 int64_t first_col,
+                 int64_t last_col,
+                 float64_t[:] values):
+        super(Float641DArrayOverwrite, self).__init__(
+            first_row=first_row,
+            last_row=last_row,
+            first_col=first_col,
+            last_col=last_col,
+        )
+        if last_row + 1 - first_row != len(values):
+            raise ValueError(
+                "Mismatch: got %d values for rows starting at index %d and "
+                "ending at index %d." % (len(values), first_row, last_row)
+            )
+        self.values = values
+
+    cpdef mutate(self, float64_t[:, :] data):
+        cdef Py_ssize_t i, row, col
+        cdef float64_t[:] values = self.values
+        for col in range(self.first_col, self.last_col + 1):
+            for i, row in enumerate(range(self.first_row, self.last_row + 1)):
+                data[row, col] = values[i]
+
+
+cdef class Datetime641DArrayOverwrite(ArrayAdjustment):
+    """
+    An adjustment that overwrites subarrays with a value for each subarray.
+
+    Example
+    -------
+
+    >>> import numpy as np; import pandas as pd
+    >>> dts = pd.date_range('2014', freq='D', periods=9, tz='UTC')
+    >>> arr = dts.values.reshape(3, 3)
+    >>> arr == np.datetime64(0, 'ns')
+    array([[False, False, False],
+       [False, False, False],
+       [False, False, False]], dtype=bool)
+    >>> adj = Datetime641DArrayOverwrite(
+    ...           first_row=1,
+    ...           last_row=2,
+    ...           first_col=1,
+    ...           last_col=2,
+    ...           values=np.array([
+    ...               np.datetime64(0, 'ns'),
+    ...               np.datetime64(1, 'ns')
+    ...           ])
+    ...       )
+    >>> adj.mutate(arr.view(np.int64))
+    >>> arr == np.datetime64(0, 'ns')
+    array([[False, False, False],
+       [False,  True,  True],
+       [False, False, False]], dtype=bool)
+    >>> arr == np.datetime64(1, 'ns')
+    array([[False, False, False],
+       [False, False, False],
+       [False,  True,  True]], dtype=bool)
+    """
+    def __init__(self,
+                 int64_t first_row,
+                 int64_t last_row,
+                 int64_t first_col,
+                 int64_t last_col,
+                 object values):
+        super(Datetime641DArrayOverwrite, self).__init__(
+            first_row=first_row,
+            last_row=last_row,
+            first_col=first_col,
+            last_col=last_col,
+        )
+        if last_row + 1 - first_row != len(values):
+            raise ValueError("Mismatch: got %d values for rows starting at"
+            " index %d and ending at index %d." % (
+                len(values), first_row, last_row)
+            )
+        self.values = asarray([datetime_to_int(value) for value in values])
+
+    cpdef mutate(self, int64_t[:, :] data):
+        cdef Py_ssize_t i, row, col
+        cdef int64_t[:] values = self.values
+        for col in range(self.first_col, self.last_col + 1):
+            for i, row in enumerate(range(self.first_row, self.last_row + 1)):
+                data[row, col] = values[i]
+
+    def __reduce__(self):
+        return type(self), (
+            self.first_row,
+            self.last_row,
+            self.first_col,
+            self.last_col,
+            self.values.view('datetime64[ns]'),
+        )
+
+
 cdef class Float64Add(Float64Adjustment):
     """
     An adjustment that adds a float.
@@ -410,9 +644,6 @@ cdef class _Int64Adjustment(Adjustment):
     This is private because we never actually operate on integers as data, but
     we use integer arrays to represent datetime and timedelta data.
     """
-    cdef:
-        readonly int64_t value
-
     def __init__(self,
                  Py_ssize_t first_row,
                  Py_ssize_t last_row,
@@ -441,6 +672,45 @@ cdef class _Int64Adjustment(Adjustment):
         )
 
 
+cdef class Int64Overwrite(_Int64Adjustment):
+    """
+    An adjustment that overwrites with an int.
+
+    Example
+    -------
+
+    >>> import numpy as np
+    >>> arr = np.arange(9, dtype=int).reshape(3, 3)
+    >>> arr
+    array([[ 0,  1,  2],
+           [ 3,  4,  5],
+           [ 6,  7,  8]])
+
+    >>> adj = Int64Overwrite(
+    ...     first_row=1,
+    ...     last_row=2,
+    ...     first_col=1,
+    ...     last_col=2,
+    ...     value=0,
+    ... )
+    >>> adj.mutate(arr)
+    >>> arr
+    array([[ 0,  1,  2],
+           [ 3,  0,  0],
+           [ 6,  0,  0]])
+    """
+
+    cpdef mutate(self, int64_t[:, :] data):
+        cdef Py_ssize_t row, col
+        cdef int64_t value = self.value
+
+        # last_col + 1 because last_col should also be affected.
+        for col in range(self.first_col, self.last_col + 1):
+            # last_row + 1 because last_row should also be affected.
+            for row in range(self.first_row, self.last_row + 1):
+                data[row, col] = value
+
+
 cdef datetime_to_int(object datetimelike):
     """
     Coerce a datetime-like object to the int format used by AdjustedArrays of
@@ -458,7 +728,7 @@ cdef datetime_to_int(object datetimelike):
             datetimelike.dtype.name,
         )
 
-    return datetimelike.astype(int)
+    return datetimelike.astype(int64)
 
 
 cdef class Datetime64Adjustment(_Int64Adjustment):
@@ -498,6 +768,15 @@ cdef class Datetime64Adjustment(_Int64Adjustment):
                 self.last_col,
                 datetime64(self.value, 'ns'),
             )
+        )
+
+    def __reduce__(self):
+        return type(self), (
+            self.first_row,
+            self.last_row,
+            self.first_col,
+            self.last_col,
+            datetime64(self.value, 'ns'),
         )
 
 
@@ -549,9 +828,6 @@ cdef class _ObjectAdjustment(Adjustment):
     We use only this for categorical data, where our data buffer is an array of
     indices into an array of unique Python string objects.
     """
-    cdef:
-        readonly object value
-
     def __init__(self,
                  Py_ssize_t first_row,
                  Py_ssize_t last_row,
@@ -585,10 +861,79 @@ cdef class ObjectOverwrite(_ObjectAdjustment):
     cpdef mutate(self, object data):
         # data is an object here because this is intended to be used with a
         # `zipline.lib.LabelArray`.
-        cdef Py_ssize_t row, col
-        cdef object value = self.value
 
         # We don't do this in a loop because we only want to look up the label
         # code in the array's categories once.
-        data[self.first_row:self.last_row + 1,
-             self.first_col:self.last_col + 1] = self.value
+        data.set_scalar(
+            (
+                slice(self.first_row, self.last_row + 1),
+                slice(self.first_col, self.last_col + 1),
+            ),
+            self.value,
+        )
+
+
+cdef class BooleanAdjustment(Adjustment):
+    """
+    Base class for adjustments that operate on boolean data.
+
+    Notes
+    -----
+    Numpy stores boolean values in arrays of type uint8.  There's no
+    straightforward way to work with statically-typed boolean data, so
+    instead we work with uint8 values everywhere, and we do validation/coercion
+    at API boundaries.
+    """
+    def __init__(self,
+                 Py_ssize_t first_row,
+                 Py_ssize_t last_row,
+                 Py_ssize_t first_col,
+                 Py_ssize_t last_col,
+                 bint value):
+
+        super(BooleanAdjustment, self).__init__(
+            first_row=first_row,
+            last_row=last_row,
+            first_col=first_col,
+            last_col=last_col,
+        )
+        self.value = value
+
+    def __repr__(self):
+        return (
+            "%s(first_row=%d, last_row=%d,"
+            " first_col=%d, last_col=%d, value=%r)" % (
+                type(self).__name__,
+                self.first_row,
+                self.last_row,
+                self.first_col,
+                self.last_col,
+                bool(self.value),
+            )
+        )
+
+    def __reduce__(self):
+        return type(self), (
+            self.first_row,
+            self.last_row,
+            self.first_col,
+            self.last_col,
+            bool(self.value),
+        )
+
+
+cdef class BooleanOverwrite(BooleanAdjustment):
+    """
+    An adjustment that overwrites with a boolean.
+
+    This operates on uint8 data.
+    """
+    cpdef mutate(self, uint8_t[:, :] data):
+        cdef Py_ssize_t row, col
+        cdef uint8_t value = self.value
+
+        # last_col + 1 because last_col should also be affected.
+        for col in range(self.first_col, self.last_col + 1):
+            # last_row + 1 because last_row should also be affected.
+            for row in range(self.first_row, self.last_row + 1):
+                data[row, col] = value

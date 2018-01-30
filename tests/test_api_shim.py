@@ -3,11 +3,10 @@ import warnings
 from mock import patch
 import numpy as np
 import pandas as pd
-from pandas.io.common import PerformanceWarning
+from pandas.core.common import PerformanceWarning
 
 from zipline import TradingAlgorithm
 from zipline.finance.trading import SimulationParameters
-from zipline.protocol import BarData
 from zipline.testing import (
     MockDailyBarReader,
     create_daily_df_for_asset,
@@ -15,6 +14,7 @@ from zipline.testing import (
     str_to_seconds,
 )
 from zipline.testing.fixtures import (
+    WithCreateBarData,
     WithDataPortal,
     WithSimParams,
     ZiplineTestCase,
@@ -113,8 +113,28 @@ def handle_data(context, data):
     assert iter_list == items_list
 """
 
+reference_missing_position_by_int_algo = """
+def initialize(context):
+    pass
 
-class TestAPIShim(WithDataPortal, WithSimParams, ZiplineTestCase):
+def handle_data(context, data):
+    context.portfolio.positions[24]
+"""
+
+reference_missing_position_by_unexpected_type_algo = """
+def initialize(context):
+    pass
+
+def handle_data(context, data):
+    context.portfolio.positions["foobar"]
+"""
+
+
+class TestAPIShim(WithCreateBarData,
+                  WithDataPortal,
+                  WithSimParams,
+                  ZiplineTestCase,
+                  ):
     START_DATE = pd.Timestamp("2016-01-05", tz='UTC')
     END_DATE = pd.Timestamp("2016-01-28", tz='UTC')
     SIM_PARAMS_DATA_FREQUENCY = 'minute'
@@ -186,9 +206,8 @@ class TestAPIShim(WithDataPortal, WithSimParams, ZiplineTestCase):
         test_end_minute = self.trading_calendar.minutes_for_session(
             self.sim_params.sessions[0]
         )[-1]
-        bar_data = BarData(
-            self.data_portal,
-            lambda: test_end_minute, "minute"
+        bar_data = self.create_bardata(
+            lambda: test_end_minute,
         )
         ohlcvp_fields = [
             "open",
@@ -246,6 +265,7 @@ class TestAPIShim(WithDataPortal, WithSimParams, ZiplineTestCase):
                         5,
                         "1m",
                         "volume",
+                        "minute",
                         True
                     )
                 else:
@@ -255,6 +275,7 @@ class TestAPIShim(WithDataPortal, WithSimParams, ZiplineTestCase):
                         5,
                         "1m",
                         "volume",
+                        "minute",
                     )
 
         test_sim_params = SimulationParameters(
@@ -510,3 +531,33 @@ class TestAPIShim(WithDataPortal, WithSimParams, ZiplineTestCase):
                     self.assertEqual("Iterating over the assets in `data` is "
                                      "deprecated.",
                                      str(warning.message))
+
+    def test_reference_empty_position_by_int(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("default", ZiplineDeprecationWarning)
+
+            algo = self.create_algo(reference_missing_position_by_int_algo)
+            algo.run(self.data_portal)
+
+            self.assertEqual(1, len(w))
+            self.assertEqual(
+                str(w[0].message),
+                "Referencing positions by integer is deprecated. Use an asset "
+                "instead."
+            )
+
+    def test_reference_empty_position_by_unexpected_type(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("default", ZiplineDeprecationWarning)
+
+            algo = self.create_algo(
+                reference_missing_position_by_unexpected_type_algo
+            )
+            algo.run(self.data_portal)
+
+            self.assertEqual(1, len(w))
+            self.assertEqual(
+                str(w[0].message),
+                "Position lookup expected a value of type Asset but got str"
+                " instead."
+            )

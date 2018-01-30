@@ -19,13 +19,18 @@
 #
 # You can also run an algo using the docker exec command.  For example:
 #
-#    docker exec -it zipline zipline run -f /projects/my_algo.py --start 2015-1-1 --end 2016-1-1 /projects/result.pickle
+#    docker exec -it zipline zipline run -f /projects/my_algo.py --start 2015-1-1 --end 2016-1-1 -o /projects/result.pickle
 #
-FROM python:2.7
+FROM python:3.5
 
 #
 # set up environment
 #
+ENV TINI_VERSION v0.10.0
+ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
+RUN chmod +x /tini
+ENTRYPOINT ["/tini", "--"]
+
 ENV PROJECT_DIR=/projects \
     NOTEBOOK_PORT=8888 \
     SSL_CERT_PEM=/root/.jupyter/jupyter.pem \
@@ -40,7 +45,7 @@ ENV PROJECT_DIR=/projects \
 RUN mkdir ${PROJECT_DIR} \
     && apt-get -y update \
     && apt-get -y install libfreetype6-dev libpng-dev libopenblas-dev liblapack-dev gfortran \
-    && curl -L http://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz | tar xvz
+    && curl -L https://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz | tar xvz
 
 #
 # build and install zipline from source.  install TA-Lib after to ensure
@@ -49,13 +54,14 @@ RUN mkdir ${PROJECT_DIR} \
 
 WORKDIR /ta-lib
 
-RUN pip install numpy==1.9.2 \
-  && pip install scipy==0.15.1 \
-  && pip install pandas==0.16.1 \
+RUN pip install 'numpy>=1.11.1,<2.0.0' \
+  && pip install 'scipy>=0.17.1,<1.0.0' \
+  && pip install 'pandas>=0.18.1,<1.0.0' \
   && ./configure --prefix=/usr \
   && make \
   && make install \
   && pip install TA-Lib \
+  && pip install matplotlib \
   && pip install jupyter
 
 #

@@ -16,10 +16,11 @@ from zipline.errors import (
     UnsupportedDataType,
     NoFurtherDataError,
 )
-from zipline.utils.control_flow import nullctx
+from zipline.utils.context_tricks import nop_context
 from zipline.utils.input_validation import expect_types
 from zipline.utils.sharedoc import (
     format_docstring,
+    PIPELINE_ALIAS_NAME_DOC,
     PIPELINE_DOWNSAMPLING_FREQUENCY_DOC,
 )
 from zipline.utils.pandas_utils import nearest_unequal_elements
@@ -105,7 +106,7 @@ class CustomTermMixin(object):
 
     Used by CustomFactor, CustomFilter, CustomClassifier, etc.
     """
-    ctx = nullctx()
+    ctx = nop_context
 
     def __new__(cls,
                 inputs=NotSpecified,
@@ -215,6 +216,7 @@ class CustomTermMixin(object):
         return out
 
     def short_repr(self):
+        """Short repr to use when rendering Pipeline graphs."""
         return type(self).__name__ + '(%d)' % self.window_length
 
 
@@ -238,6 +240,81 @@ class LatestMixin(SingleInputMixin):
                     actual=self.inputs[0].dtype,
                 )
             )
+
+    def short_repr(self):
+        return "{}.latest".format(self.inputs[0].short_repr())
+
+
+class AliasedMixin(SingleInputMixin):
+    """
+    Mixin for aliased terms.
+    """
+    def __new__(cls, term, name):
+        return super(AliasedMixin, cls).__new__(
+            cls,
+            inputs=(term,),
+            outputs=term.outputs,
+            window_length=0,
+            name=name,
+            dtype=term.dtype,
+            missing_value=term.missing_value,
+            ndim=term.ndim,
+            window_safe=term.window_safe,
+        )
+
+    def _init(self, name, *args, **kwargs):
+        self.name = name
+        return super(AliasedMixin, self)._init(*args, **kwargs)
+
+    @classmethod
+    def _static_identity(cls, name, *args, **kwargs):
+        return (
+            super(AliasedMixin, cls)._static_identity(*args, **kwargs),
+            name,
+        )
+
+    def _compute(self, inputs, dates, assets, mask):
+        return inputs[0]
+
+    def __repr__(self):
+        return '{type}({inner_type}(...), name={name!r})'.format(
+            type=type(self).__name__,
+            inner_type=type(self.inputs[0]).__name__,
+            name=self.name,
+        )
+
+    def short_repr(self):
+        """Short repr to use when rendering Pipeline graphs."""
+        return self.name
+
+    @classmethod
+    def make_aliased_type(cls, other_base):
+        """
+        Factory for making Aliased{Filter,Factor,Classifier}.
+        """
+        docstring = dedent(
+            """
+            A {t} that names another {t}.
+
+            Parameters
+            ----------
+            term : {t}
+            {{name}}
+            """
+        ).format(t=other_base.__name__)
+
+        doc = format_docstring(
+            owner_name=other_base.__name__,
+            docstring=docstring,
+            formatters={'name': PIPELINE_ALIAS_NAME_DOC},
+        )
+
+        return type(
+            'Aliased' + other_base.__name__,
+            (cls, other_base),
+            {'__doc__': doc,
+             '__module__': other_base.__module__},
+        )
 
 
 class DownsampledMixin(StandardOutputs):
@@ -314,7 +391,7 @@ class DownsampledMixin(StandardOutputs):
         try:
             current_start_pos = all_dates.get_loc(start_date) - min_extra_rows
             if current_start_pos < 0:
-                raise NoFurtherDataError(
+                raise NoFurtherDataError.from_lookback_window(
                     initial_message="Insufficient data to compute Pipeline:",
                     first_date=all_dates[0],
                     lookback_start=start_date,
